@@ -113,11 +113,12 @@ def write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def git(repo: Path, *args: str, env: Optional[Dict[str, str]] = None, check: bool = True) -> str:
+def git(repo: Path, *args: str, env: Optional[Dict[str, str]] = None, check: bool = True, strip: bool = True) -> str:
+    """Run git in repo. Pass strip=False for diffs: trailing whitespace is part of the patch."""
     proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env)
     if check and proc.returncode != 0:
         raise HarnessError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
+    return proc.stdout.strip() if strip else proc.stdout
 
 
 def repo_root(path: str) -> Path:
@@ -210,7 +211,8 @@ class Run:
         self.repo = repo
         self.id = run_id
         self.dir = runs_dir(repo) / run_id
-        self.lock = threading.Lock()
+        # Reentrant: the SIGTERM handler runs on the main thread and may interrupt it while it holds the lock.
+        self.lock = threading.RLock()
         self.data: Dict[str, Any] = json.loads((self.dir / "state.json").read_text())
         self.exhausted: set = set()
         self.children: set = set()
@@ -593,14 +595,16 @@ def run_worker(run: Run, task: Dict[str, Any], plan: Dict[str, Any], worker: Dic
         git(worktree, "add", "-N", "--all")
         changed = [p for p in git(worktree, "diff", "--name-only", base).splitlines()
                    if p and not p.startswith(TOOL_NOISE)]
-        outside = [p for p in changed if not in_scope(p, worker["owned_paths"])]
+        # Owned directories can still contain sensitive/protected files (e.g. app/.env); withhold those too.
+        protected = protected_paths(worktree)
+        outside = [p for p in changed if not in_scope(p, worker["owned_paths"]) or is_protected(p, protected)]
         patch_rel = f"results/{task['name']}.patch"
-        patch = git(worktree, "diff", "--binary", base, "--", *worker["owned_paths"]) if changed else ""
-        (run.dir / patch_rel).write_text(patch + ("\n" if patch else ""))
+        patch = git(worktree, "diff", "--binary", base, "--", *worker["owned_paths"], strip=False) if changed else ""
+        (run.dir / patch_rel).write_text(patch)
         if outside:
             (run.dir / f"results/{task['name']}.out-of-scope.txt").write_text("\n".join(outside) + "\n")
             run.set_task(task, state="out-of-scope", patch=patch_rel, changed_files=len(changed), ended=now())
-            run.event(f"{task['name']}: changed files outside owned paths; patch withheld")
+            run.event(f"{task['name']}: changed files outside owned paths or protected; patch withheld")
         else:
             run.set_task(task, state="done", patch=patch_rel, changed_files=len(changed), ended=now())
             run.event(f"{task['name']}: done on {task['provider']} ({len(changed)} files)")
@@ -700,10 +704,10 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
             run.event(f"{task['name']}: patch conflict, not integrated")
             git(integration, "reset", "--hard", "-q", check=False)
             continue
+        # Commit each patch right away so a later conflict's reset cannot discard it.
+        git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {task['name']}")
         run.set_task(task, state="integrated")
         applied.append(task["name"])
-    if applied:
-        git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {', '.join(applied)}")
     missing = [t for t in tasks if t["name"] not in applied
                and (t["name"] in approved or t["name"].split("-", 1)[1] in approved)
                and t["state"] != "done"]
@@ -744,8 +748,8 @@ def execute(run: Run) -> None:
                 break
             feedback = review.get("feedback") or "Previous round incomplete; continue the command."
         head = git(integration, "rev-parse", "HEAD")
-        final = git(integration, "diff", "--binary", base, head) if head != base else ""
-        (run.dir / "final.patch").write_text(final + ("\n" if final else ""))
+        final = git(integration, "diff", "--binary", base, head, strip=False) if head != base else ""
+        (run.dir / "final.patch").write_text(final)
         files = git(integration, "diff", "--name-only", base, head).splitlines() if final else []
         run.update(status="ready" if final else "no-changes", ended=now(), final_files=files,
                    summary=review.get("summary"), feedback=None if review.get("done") else review.get("feedback"),
