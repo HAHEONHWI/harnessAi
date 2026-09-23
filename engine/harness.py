@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 HOME_DIR = Path(os.environ.get("AI_HARNESS_HOME", str(Path.home() / ".ai-harness")))
 CONFIG_PATH = HOME_DIR / "config.json"
@@ -65,6 +65,8 @@ LIMIT_RE = re.compile(
     r"exceeded|budget|upgrade (your|to|plan)|not logged in|unauthori[sz]ed|authentication",
     re.I,
 )
+# CLIs that exit 0 without doing anything (e.g. agy auto-denying a tool in headless mode).
+NO_OUTPUT_RE = re.compile(r"no output produced|auto-denied|cannot prompt for", re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 PATH_RE = re.compile(r"^([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$")
@@ -286,6 +288,7 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
     if provider == "claude":
         tools = "Read,Glob,Grep,Edit,Write" if write else "Read,Glob,Grep"
         cmd = ["claude", "-p", prompt, "--model", model or "opus", "--effort", cfg.get("effort", "max"),
+               "--output-format", "stream-json", "--verbose",
                "--permission-mode", "acceptEdits" if write else "plan", "--allowedTools", tools,
                "--no-session-persistence", "--max-budget-usd", str(cfg.get("max_budget_usd", 5)),
                "--append-system-prompt", COMMON_RULES]
@@ -303,6 +306,8 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
 
 def classify_failure(code: int, output: str) -> str:
     tail = "\n".join(output.strip().splitlines()[-40:])
+    if code == 0 and NO_OUTPUT_RE.search(tail):
+        return "no-output"
     if code != 0 and LIMIT_RE.search(tail):
         return "limit"
     if code == 0 and re.search(r"(?im)^\W*(error|fatal)\b.*$", tail):
@@ -329,7 +334,7 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         if not pcfg or not pcfg.get("enabled", False):
             skip = "disabled"
         elif provider in run.exhausted:
-            skip = "limit reached earlier in this run"
+            skip = "limit or no output earlier in this run"
         elif not shutil.which(PROVIDER_CLI[provider]):
             skip = f"{PROVIDER_CLI[provider]} not installed"
         if skip:
@@ -342,30 +347,55 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         cmd, stdin_text = provider_command(provider, pcfg, mode, workdir, prompt, message_file, timeout_min)
         run.set_task(task, provider=provider, log=log_rel)
         run.event(f"{base_name}: {pcfg.get('label', provider)} started")
-        code = run_process(run, cmd, stdin_text, workdir, run.dir / log_rel, timeout_min * 60)
+        stream = ClaudeStream() if provider == "claude" else None
+        code = run_process(run, cmd, stdin_text, workdir, run.dir / log_rel, timeout_min * 60,
+                           stream.line if stream else None)
         run.check_stop()  # some CLIs exit 0 when killed; never treat a stopped call as success
+        if stream and stream.result is not None:
+            message_file.write_text(stream.result)
         output = ANSI_RE.sub("", (run.dir / log_rel).read_text(errors="replace"))
         status = "timeout" if code == 124 else classify_failure(code, output)
+        result = ""
+        if status == "ok":
+            result = message_file.read_text(errors="replace") if message_file.exists() else output
+            if not result.strip():
+                status = "no-output"
         attempt = {"provider": provider, "status": status, "exit": code, "log": log_rel}
         run.set_task(task, attempts=task["attempts"] + [attempt])
         if status == "ok":
-            result = message_file.read_text(errors="replace") if message_file.exists() else output
             result_rel = f"results/{base_name}.result.md"
             (run.dir / result_rel).write_text(result)
             run.set_task(task, result=result_rel)
             return result
-        if status == "limit":
+        if status in ("limit", "no-output"):
             run.exhausted.add(provider)
-            run.event(f"{base_name}: {provider} hit a usage/rate limit, falling back")
+            reason = "hit a usage/rate limit" if status == "limit" else "finished without producing output"
+            run.event(f"{base_name}: {provider} {reason}, falling back")
             continue
         raise HarnessError(f"{base_name}: {provider} failed ({status}, exit {code}); see {log_rel}")
     raise HarnessError(f"{base_name}: no available provider in chain {' -> '.join(chain)}")
 
 
-def run_process(run: Run, cmd: List[str], stdin_text: Optional[str], cwd: Path, log: Path, timeout: int) -> int:
+def run_process(run: Run, cmd: List[str], stdin_text: Optional[str], cwd: Path, log: Path, timeout: int,
+                formatter: Optional[Callable[[str], Optional[str]]] = None) -> int:
+    """Run cmd with output in log. With a formatter, raw output goes to <log>.jsonl and
+    the log gets the formatter's readable lines as they stream in."""
     with log.open("w") as out:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                                stdout=out, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                stdout=subprocess.PIPE if formatter else out, stderr=subprocess.STDOUT, text=True,
+                                errors="replace", start_new_session=True)
+        reader = None
+        if formatter:
+            def pump() -> None:
+                with log.with_suffix(".jsonl").open("w") as raw:
+                    for line in proc.stdout:
+                        raw.write(line)
+                        text = formatter(line)
+                        if text:
+                            out.write(text + "\n")
+                            out.flush()
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
         with run.lock:
             run.children.add(proc)
         try:
@@ -377,8 +407,51 @@ def run_process(run: Run, cmd: List[str], stdin_text: Optional[str], cwd: Path, 
             kill_group(proc)
             return 124
         finally:
+            if reader:
+                reader.join(timeout=10)
             with run.lock:
                 run.children.discard(proc)
+
+
+class ClaudeStream:
+    """Turns `claude -p --output-format stream-json` events into readable progress lines
+    and keeps the final result text."""
+
+    def __init__(self) -> None:
+        self.result: Optional[str] = None
+
+    def line(self, raw: str) -> Optional[str]:
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.rstrip("\n") or None  # stderr and other plain text pass through
+        if not isinstance(ev, dict):
+            return None
+        kind = ev.get("type")
+        if kind == "system" and ev.get("subtype") == "init":
+            return f"[start] model {ev.get('model', '?')}"
+        if kind == "assistant":
+            parts = []
+            for block in (ev.get("message") or {}).get("content") or []:
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    parts.append(clip(block["text"].strip(), 400))
+                elif block.get("type") == "tool_use":
+                    args = block.get("input") or {}
+                    target = next((str(args[k]) for k in ("file_path", "path", "pattern", "command") if k in args), "")
+                    parts.append(f"[tool] {block.get('name')} {target}".rstrip())
+            return "\n".join(parts) or None
+        if kind == "result":
+            self.result = str(ev.get("result") or "")
+            head = "[done]"
+            if ev.get("is_error"):  # keep subtype/errors/status so classify_failure can spot limits (e.g. error_max_budget_usd, 429)
+                details = [str(ev.get("subtype") or ""), *map(str, ev.get("errors") or [])]
+                if ev.get("api_error_status"):
+                    details.append(f"status {ev['api_error_status']}")
+                head = "[error] " + " ".join(d for d in details if d)
+            cost = ev.get("total_cost_usd")
+            meta = f" {ev.get('num_turns', '?')} turns" + (f", ${cost:.2f}" if isinstance(cost, (int, float)) else "")
+            return f"{head}{meta}\n{self.result}"
+        return None
 
 
 def kill_group(proc: subprocess.Popen) -> None:
