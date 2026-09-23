@@ -527,7 +527,9 @@ struct RunView: View {
                     HStack(spacing: 12) {
                         StatusBadge(status: run.displayStatus)
                         Text("round \(run.round)/\(run.maxRounds)").font(.caption).foregroundStyle(.secondary)
-                        Text(formatDuration(run.started, run.ended)).font(.caption).foregroundStyle(.secondary)
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in
+                            Text(formatDuration(run.started, run.ended)).font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     if let scope = run.scope, !scope.isEmpty {
                         Label(scope.joined(separator: ", "), systemImage: "scope")
@@ -595,7 +597,10 @@ struct TaskRow: View {
                 StatusBadge(status: task.state)
             }
             HStack(spacing: 12) {
-                Label(formatDuration(task.started, task.ended), systemImage: "clock")
+                // state.json only changes on events, so tick the clock locally while a task runs.
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Label(formatDuration(task.started, task.ended), systemImage: "clock")
+                }
                 if let changed = task.changedFiles { Label("\(changed) files", systemImage: "doc") }
                 if let owned = task.ownedPaths { Text(owned.joined(separator: ", ")).lineLimit(1) }
             }
