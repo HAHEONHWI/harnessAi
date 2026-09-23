@@ -33,10 +33,10 @@ OPENCODE_AGENTS = Path.home() / ".config/opencode/agents"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "providers": {
-        "sol": {"label": "Codex Sol", "enabled": True, "model": "gpt-5.6-sol", "effort": "max"},
-        "luna": {"label": "Codex Luna", "enabled": True, "model": "gpt-5.6-luna", "effort": "high"},
+        "sol": {"label": "Codex Sol", "enabled": True, "model": "gpt-5.6-sol", "effort": "high"},
+        "luna": {"label": "Codex Luna", "enabled": True, "model": "gpt-5.6-luna", "effort": "max"},
         "kimi": {"label": "OpenCode Kimi", "enabled": True, "model": "kimi-code-plan-global/kimi-for-coding"},
-        "claude": {"label": "Claude Opus", "enabled": True, "model": "opus", "effort": "max", "max_budget_usd": 5},
+        "claude": {"label": "Claude Opus", "enabled": True, "model": "opus", "effort": "high", "max_budget_usd": 5},
         "antigravity": {"label": "Antigravity", "enabled": True, "model": ""},
     },
     "fallback": {
@@ -52,6 +52,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")
+COORDINATOR = "claude"  # plans and reviews every round
 
 # GUI apps start with a minimal PATH; make the agent CLIs reachable.
 os.environ["PATH"] = os.pathsep.join(
@@ -113,11 +114,12 @@ def write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def git(repo: Path, *args: str, env: Optional[Dict[str, str]] = None, check: bool = True) -> str:
+def git(repo: Path, *args: str, env: Optional[Dict[str, str]] = None, check: bool = True, strip: bool = True) -> str:
+    """Run git in repo. Pass strip=False for diffs: trailing whitespace is part of the patch."""
     proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env)
     if check and proc.returncode != 0:
         raise HarnessError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
+    return proc.stdout.strip() if strip else proc.stdout
 
 
 def repo_root(path: str) -> Path:
@@ -210,7 +212,8 @@ class Run:
         self.repo = repo
         self.id = run_id
         self.dir = runs_dir(repo) / run_id
-        self.lock = threading.Lock()
+        # Reentrant: the SIGTERM handler runs on the main thread and may interrupt it while it holds the lock.
+        self.lock = threading.RLock()
         self.data: Dict[str, Any] = json.loads((self.dir / "state.json").read_text())
         self.exhausted: set = set()
         self.children: set = set()
@@ -398,8 +401,8 @@ def role_guide(cfg: Dict[str, Any]) -> str:
         "luna": "Codex Luna: fast, medium cost. Bounded implementation and QA.",
         "kimi": "OpenCode Kimi: cheap but slower. Broad mapping, repetitive edits, docs.",
         "antigravity": "Google Antigravity: frontend/UI work and alternative implementations.",
-        "claude": "Claude Opus: strongest but expensive. Only hard design or security-critical code.",
-        "sol": "Codex Sol: coordinator; avoid assigning worker tasks to it.",
+        "claude": "Claude Opus: coordinator and security reviewer; avoid assigning worker tasks to it.",
+        "sol": "Codex Sol: strongest Codex, expensive. Hard design or security-critical code.",
     }
     lines = []
     for role in WORKER_ROLES:
@@ -593,14 +596,16 @@ def run_worker(run: Run, task: Dict[str, Any], plan: Dict[str, Any], worker: Dic
         git(worktree, "add", "-N", "--all")
         changed = [p for p in git(worktree, "diff", "--name-only", base).splitlines()
                    if p and not p.startswith(TOOL_NOISE)]
-        outside = [p for p in changed if not in_scope(p, worker["owned_paths"])]
+        # Owned directories can still contain sensitive/protected files (e.g. app/.env); withhold those too.
+        protected = protected_paths(worktree)
+        outside = [p for p in changed if not in_scope(p, worker["owned_paths"]) or is_protected(p, protected)]
         patch_rel = f"results/{task['name']}.patch"
-        patch = git(worktree, "diff", "--binary", base, "--", *worker["owned_paths"]) if changed else ""
-        (run.dir / patch_rel).write_text(patch + ("\n" if patch else ""))
+        patch = git(worktree, "diff", "--binary", base, "--", *worker["owned_paths"], strip=False) if changed else ""
+        (run.dir / patch_rel).write_text(patch)
         if outside:
             (run.dir / f"results/{task['name']}.out-of-scope.txt").write_text("\n".join(outside) + "\n")
             run.set_task(task, state="out-of-scope", patch=patch_rel, changed_files=len(changed), ended=now())
-            run.event(f"{task['name']}: changed files outside owned paths; patch withheld")
+            run.event(f"{task['name']}: changed files outside owned paths or protected; patch withheld")
         else:
             run.set_task(task, state="done", patch=patch_rel, changed_files=len(changed), ended=now())
             run.event(f"{task['name']}: done on {task['provider']} ({len(changed)} files)")
@@ -617,9 +622,9 @@ def run_worker(run: Run, task: Dict[str, Any], plan: Dict[str, Any], worker: Dic
 def coordinator_call(run: Run, name: str, kind: str, workdir: Path, build_prompt, validate=None) -> Dict[str, Any]:
     error = None
     for attempt in (1, 2):
-        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role="sol")
+        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role=COORDINATOR)
         try:
-            data = extract_json(call_agent(run, task, "sol", "read", workdir, build_prompt(error)))
+            data = extract_json(call_agent(run, task, COORDINATOR, "read", workdir, build_prompt(error)))
             if validate:
                 validate(data)
             run.set_task(task, state="done", ended=now())
@@ -700,10 +705,10 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
             run.event(f"{task['name']}: patch conflict, not integrated")
             git(integration, "reset", "--hard", "-q", check=False)
             continue
+        # Commit each patch right away so a later conflict's reset cannot discard it.
+        git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {task['name']}")
         run.set_task(task, state="integrated")
         applied.append(task["name"])
-    if applied:
-        git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {', '.join(applied)}")
     missing = [t for t in tasks if t["name"] not in applied
                and (t["name"] in approved or t["name"].split("-", 1)[1] in approved)
                and t["state"] != "done"]
@@ -744,8 +749,8 @@ def execute(run: Run) -> None:
                 break
             feedback = review.get("feedback") or "Previous round incomplete; continue the command."
         head = git(integration, "rev-parse", "HEAD")
-        final = git(integration, "diff", "--binary", base, head) if head != base else ""
-        (run.dir / "final.patch").write_text(final + ("\n" if final else ""))
+        final = git(integration, "diff", "--binary", base, head, strip=False) if head != base else ""
+        (run.dir / "final.patch").write_text(final)
         files = git(integration, "diff", "--name-only", base, head).splitlines() if final else []
         run.update(status="ready" if final else "no-changes", ended=now(), final_files=files,
                    summary=review.get("summary"), feedback=None if review.get("done") else review.get("feedback"),

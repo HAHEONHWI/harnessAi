@@ -8,11 +8,11 @@
 ## 동작 방식
 
 ```
-명령 → 스냅샷 → Sol 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Sol 리뷰 → 통합 → 반복 → final.patch → Apply
+명령 → 스냅샷 → Claude 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Claude 리뷰 → 통합 → 반복 → final.patch → Apply
 ```
 
 1. 현재 작업 트리(커밋 안 된 파일 포함)를 스냅샷으로 뜹니다. HEAD, index, stash는 건드리지 않습니다.
-2. 조율자(`sol`)가 작업을 1~4개로 나누고, 워커마다 겹치지 않는 수정 가능 경로를 정합니다.
+2. 조율자(`claude`)가 작업을 1~4개로 나누고, 워커마다 겹치지 않는 수정 가능 경로를 정합니다.
 3. 워커는 각자 별도 `git worktree`에서 병렬로 실행됩니다. 허용 경로 밖을 수정한 patch는 보류됩니다.
 4. 보안 관련 변경이면 Claude가 patch를 리뷰합니다.
 5. 조율자가 승인한 patch만 전용 통합 worktree에 반영하고, 필요하면 다음 라운드를 진행합니다(기본 최대 3라운드).
@@ -22,10 +22,10 @@
 
 | 역할 | 기본 모델 | 용도 | 한도 초과 시 fallback |
 |---|---|---|---|
-| `sol` | Codex `gpt-5.6-sol` | 계획·리뷰 (조율자) | kimi → claude → antigravity |
-| `luna` | Codex `gpt-5.6-luna` | 빠른 구현, QA | kimi → antigravity → claude |
+| `sol` | Codex `gpt-5.6-sol` (effort high) | 고난도 구현 | kimi → claude → antigravity |
+| `luna` | Codex `gpt-5.6-luna` (effort max) | 빠른 구현, QA | kimi → antigravity → claude |
 | `kimi` | OpenCode `kimi-for-coding` | 저비용 반복 작업, 문서 | luna → antigravity → claude |
-| `claude` | Claude Code `opus` | 보안 리뷰, 고난도 작업 | sol → luna → kimi → antigravity |
+| `claude` | Claude Code `opus` (effort high) | 계획·리뷰 (조율자), 보안 리뷰 | sol → luna → kimi → antigravity |
 | `antigravity` | `agy` | UI·대안 구현 | kimi → luna → claude |
 
 - 다음 모델로 넘어가는 조건: 사용량·쿼터·rate limit 오류, 모델 off, CLI 미설치.
