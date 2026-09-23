@@ -65,8 +65,8 @@ LIMIT_RE = re.compile(
     r"exceeded|budget|upgrade (your|to|plan)|not logged in|unauthori[sz]ed|authentication",
     re.I,
 )
-# CLIs that exit 0 without doing anything (e.g. agy auto-denying a tool in headless mode).
-NO_OUTPUT_RE = re.compile(r"no output produced|auto-denied|cannot prompt for", re.I)
+# CLIs that exit 0 without finishing (e.g. agy auto-denying a tool, or hitting its print timeout mid-turn).
+NO_OUTPUT_RE = re.compile(r"no output produced|auto-denied|cannot prompt for|print timeout after", re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 PATH_RE = re.compile(r"^([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$")
@@ -298,7 +298,11 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
                "--print-timeout", f"{timeout_min}m"]
         if model:
             cmd += ["--model", model]
-        if write:
+        # Headless agy auto-denies shell commands it cannot prompt for. "skip_permissions" auto-approves
+        # every tool instead; it runs without --sandbox because sandboxed commands hang until the print timeout.
+        if cfg.get("skip_permissions"):
+            cmd.append("--dangerously-skip-permissions")
+        elif write:
             cmd.append("--sandbox")
         return cmd, None
     raise HarnessError(f"unknown provider {provider}")
