@@ -2,12 +2,13 @@
 
 ## Project
 
-`harnessAi` is a macOS multi-agent coding harness: a Python engine (`engine/harness.py`, standard library only, Python 3.9+) that orchestrates Codex, OpenCode (Kimi), Claude Code, and Antigravity CLIs with per-role fallback, plus a SwiftUI app (`app/HarnessMonitor.swift`) that drives the engine and visualizes runs.
+`harnessAi` builds HarnessLoop, a macOS multi-agent coding harness: a Python engine (`engine/harness.py`, standard library only, Python 3.9+) that orchestrates Codex, OpenCode (Kimi), Claude Code, and Antigravity CLIs with per-role fallback, plus a SwiftUI app (`app/HarnessMonitor.swift`) that drives the engine and visualizes runs.
 
 ## Structure
 
 - `engine/harness.py`: CLI + orchestration (snapshot, plan, parallel workers in git worktrees, review, integration, fallback, config).
-- `app/HarnessMonitor.swift`: single-file SwiftUI app. Reads `<project>/.ai-harness/runs/*/state.json`, calls the engine through `/bin/zsh -lc`, edits `~/.ai-harness/config.json`. Bundles and bootstraps the engine from `Contents/Resources/harness.py`.
+- `app/HarnessMonitor.swift`: single-file SwiftUI app (`HarnessLoop.app`). Reads `<project>/.ai-harness/runs/*/state.json`, calls the engine through `/bin/zsh -lc`, edits `~/.ai-harness/config.json`. Bundles and bootstraps the engine from `Contents/Resources/harness.py`.
+- `app/AppIcon.png`: 1024px icon master; `build.sh` turns it into `AppIcon.icns`.
 - `scripts/build.sh`: build universal app, optional install and release zip.
 - `scripts/install.sh`: install latest GitHub Release.
 - `.github/workflows/ci.yml`, `release.yml`: CI build; tag `v*` publishes a Release.
@@ -39,4 +40,4 @@
 
 ## Release
 
-- Push tag `vX.Y.Z` to publish; `release.yml` builds `dist/AI-Harness-macOS.zip` and creates the GitHub Release. Manual `workflow_dispatch` only uploads an artifact.
+- Push tag `vX.Y.Z` to publish; `release.yml` builds `dist/HarnessLoop-macOS.zip` and creates the GitHub Release. Manual `workflow_dispatch` only uploads an artifact.

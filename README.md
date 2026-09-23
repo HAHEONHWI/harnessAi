@@ -1,9 +1,11 @@
-# AI Harness
+<p align="center"><img src="app/AppIcon.png" width="160" alt="HarnessLoop icon"></p>
+
+# HarnessLoop
 
 여러 코딩 에이전트(Codex, OpenCode Kimi, Claude Code, Google Antigravity)를 한 명령으로 병렬 실행하는 macOS 하네스입니다. 모델이 사용량 한도에 걸리면 다음 모델로 자동 전환합니다.
 
 - **엔진** `engine/harness.py`: Python 표준 라이브러리만 사용. 어떤 Git 프로젝트에서도 동작.
-- **앱** `AI Harness.app`: SwiftUI. 프로젝트 선택, 작업 지시, 모델 on/off, 진행 상황·로그·patch 확인, 적용.
+- **앱** `HarnessLoop.app`: SwiftUI. 프로젝트 선택, 작업 지시, 모델 on/off, 진행 상황·로그·patch 확인, 적용.
 
 ## 동작 방식
 
@@ -50,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/HAHEONHWI/harnessAi/main/scripts/in
 scripts/build.sh
 ```
 
-앱은 ad-hoc 서명만 되어 있고 공증(notarization)은 받지 않았습니다. zip을 직접 받았다면 먼저 `xattr -dr com.apple.quarantine "/Applications/AI Harness.app"`을 실행하세요.
+앱은 ad-hoc 서명만 되어 있고 공증(notarization)은 받지 않았습니다. zip을 직접 받았다면 먼저 `xattr -dr com.apple.quarantine "/Applications/HarnessLoop.app"`을 실행하세요.
 
 ## 사용
 
@@ -91,7 +93,7 @@ $harness config kimi off
 
 ## 배포
 
-`v*` 태그를 push하면 `.github/workflows/release.yml`이 universal 앱을 빌드해 GitHub Release에 `AI-Harness-macOS.zip`을 올립니다.
+`v*` 태그를 push하면 `.github/workflows/release.yml`이 universal 앱을 빌드해 GitHub Release에 `HarnessLoop-macOS.zip`을 올립니다.
 
 ```bash
 git tag v0.1.0

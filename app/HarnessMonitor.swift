@@ -686,7 +686,7 @@ struct MenuContent: View {
             Text("No harness runs")
         }
         Divider()
-        Button("Open AI Harness") {
+        Button("Open HarnessLoop") {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -700,7 +700,7 @@ struct HarnessMonitorApp: App {
     @StateObject private var store = HarnessStore()
 
     var body: some Scene {
-        WindowGroup("AI Harness", id: "main") {
+        WindowGroup("HarnessLoop", id: "main") {
             ContentView()
                 .environmentObject(store)
                 .frame(minWidth: 1200, minHeight: 640)
