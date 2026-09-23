@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check engine
+        run: |
+          python3 -m py_compile engine/harness.py
+          python3 engine/harness.py --help > /dev/null
+      - name: Check scripts
+        run: bash -n scripts/build.sh scripts/install.sh
+      - name: Build app
+        run: scripts/build.sh --no-install

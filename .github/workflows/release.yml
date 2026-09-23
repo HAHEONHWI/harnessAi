@@ -1,0 +1,33 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish a GitHub Release with AI-Harness-macOS.zip.
+# Manual runs build the zip as a workflow artifact without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build and package
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          scripts/build.sh --no-install --zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Harness-macOS
+          path: dist/AI-Harness-macOS.zip
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/AI-Harness-macOS.zip --title "$GITHUB_REF_NAME" --generate-notes
