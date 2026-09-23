@@ -496,7 +496,7 @@ struct NewTaskSheet: View {
                 }
             }
             Stepper("Max rounds: \(rounds)", value: $rounds, in: 1...5)
-            Text("Sol plans and reviews, workers run in parallel on isolated worktrees, and models fall back on usage limits. Nothing touches your project until you press Apply.")
+            Text("Claude plans and reviews, workers run in parallel on isolated worktrees, and models fall back on usage limits. Nothing touches your project until you press Apply.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()

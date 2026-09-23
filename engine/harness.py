@@ -33,10 +33,10 @@ OPENCODE_AGENTS = Path.home() / ".config/opencode/agents"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "providers": {
-        "sol": {"label": "Codex Sol", "enabled": True, "model": "gpt-5.6-sol", "effort": "max"},
-        "luna": {"label": "Codex Luna", "enabled": True, "model": "gpt-5.6-luna", "effort": "high"},
+        "sol": {"label": "Codex Sol", "enabled": True, "model": "gpt-5.6-sol", "effort": "high"},
+        "luna": {"label": "Codex Luna", "enabled": True, "model": "gpt-5.6-luna", "effort": "max"},
         "kimi": {"label": "OpenCode Kimi", "enabled": True, "model": "kimi-code-plan-global/kimi-for-coding"},
-        "claude": {"label": "Claude Opus", "enabled": True, "model": "opus", "effort": "max", "max_budget_usd": 5},
+        "claude": {"label": "Claude Opus", "enabled": True, "model": "opus", "effort": "high", "max_budget_usd": 5},
         "antigravity": {"label": "Antigravity", "enabled": True, "model": ""},
     },
     "fallback": {
@@ -52,6 +52,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")
+COORDINATOR = "claude"  # plans and reviews every round
 
 # GUI apps start with a minimal PATH; make the agent CLIs reachable.
 os.environ["PATH"] = os.pathsep.join(
@@ -400,8 +401,8 @@ def role_guide(cfg: Dict[str, Any]) -> str:
         "luna": "Codex Luna: fast, medium cost. Bounded implementation and QA.",
         "kimi": "OpenCode Kimi: cheap but slower. Broad mapping, repetitive edits, docs.",
         "antigravity": "Google Antigravity: frontend/UI work and alternative implementations.",
-        "claude": "Claude Opus: strongest but expensive. Only hard design or security-critical code.",
-        "sol": "Codex Sol: coordinator; avoid assigning worker tasks to it.",
+        "claude": "Claude Opus: coordinator and security reviewer; avoid assigning worker tasks to it.",
+        "sol": "Codex Sol: strongest Codex, expensive. Hard design or security-critical code.",
     }
     lines = []
     for role in WORKER_ROLES:
@@ -621,9 +622,9 @@ def run_worker(run: Run, task: Dict[str, Any], plan: Dict[str, Any], worker: Dic
 def coordinator_call(run: Run, name: str, kind: str, workdir: Path, build_prompt, validate=None) -> Dict[str, Any]:
     error = None
     for attempt in (1, 2):
-        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role="sol")
+        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role=COORDINATOR)
         try:
-            data = extract_json(call_agent(run, task, "sol", "read", workdir, build_prompt(error)))
+            data = extract_json(call_agent(run, task, COORDINATOR, "read", workdir, build_prompt(error)))
             if validate:
                 validate(data)
             run.set_task(task, state="done", ended=now())
