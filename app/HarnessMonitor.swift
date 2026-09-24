@@ -11,6 +11,53 @@ struct Attempt: Decodable, Equatable {
     let reason: String?
 }
 
+struct Usage: Decodable, Equatable {
+    var input: Int?
+    var output: Int?
+    var cacheRead: Int?
+    var cacheWrite: Int?
+    var total: Int?
+    var costUsd: Double?
+
+    static func + (a: Usage, b: Usage) -> Usage {
+        func add(_ x: Int?, _ y: Int?) -> Int? { x == nil && y == nil ? nil : (x ?? 0) + (y ?? 0) }
+        return Usage(input: add(a.input, b.input), output: add(a.output, b.output), cacheRead: add(a.cacheRead, b.cacheRead),
+                     cacheWrite: add(a.cacheWrite, b.cacheWrite), total: add(a.total, b.total),
+                     costUsd: a.costUsd == nil && b.costUsd == nil ? nil : (a.costUsd ?? 0) + (b.costUsd ?? 0))
+    }
+
+    var detail: String {
+        var parts: [String] = []
+        if let input, input > 0 { parts.append("in \(formatTokens(input))") }
+        if let output, output > 0 { parts.append("out \(formatTokens(output))") }
+        if let cacheRead, cacheRead > 0 { parts.append("cache read \(formatTokens(cacheRead))") }
+        if let cacheWrite, cacheWrite > 0 { parts.append("cache write \(formatTokens(cacheWrite))") }
+        return parts.isEmpty ? "total only (CLI reports no breakdown)" : parts.joined(separator: " · ")
+    }
+}
+
+struct ProviderUsage: Decodable, Equatable {
+    let provider: String
+    let calls: Int
+    let input: Int?
+    let output: Int?
+    let cacheRead: Int?
+    let cacheWrite: Int?
+    let total: Int?
+    let costUsd: Double?
+
+    var usage: Usage { Usage(input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite, total: total, costUsd: costUsd) }
+}
+
+func formatTokens(_ n: Int) -> String {
+    switch n {
+    case 1_000_000...: String(format: "%.1fM", Double(n) / 1_000_000)
+    case 10_000...: "\(n / 1000)k"
+    case 1000...: String(format: "%.1fk", Double(n) / 1000)
+    default: "\(n)"
+    }
+}
+
 struct TaskState: Decodable, Identifiable, Equatable {
     let name: String
     let kind: String
@@ -28,6 +75,7 @@ struct TaskState: Decodable, Identifiable, Equatable {
     let error: String?
     let ownedPaths: [String]?
     let attempts: [Attempt]
+    let usage: Usage?
     var id: String { name }
 }
 
@@ -59,6 +107,7 @@ struct RunState: Decodable, Identifiable, Equatable {
     let verify: VerifyResult?
     let completed: Bool?
     let outsideChanges: [String]?
+    let usage: [ProviderUsage]?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
@@ -384,6 +433,12 @@ final class HarnessStore: ObservableObject {
 
     var runsDir: URL { URL(fileURLWithPath: repoPath).appendingPathComponent(".ai-harness/runs") }
     var current: RunState? { runs.first { $0.id == selectedRun } }
+    /// Per-provider token totals across all runs of the selected project.
+    var projectUsage: [String: Usage] {
+        var totals: [String: Usage] = [:]
+        for row in runs.flatMap({ $0.usage ?? [] }) { totals[row.provider] = (totals[row.provider] ?? Usage()) + row.usage }
+        return totals
+    }
     var activeTaskCount: Int { runs.filter(\.isActive).flatMap(\.tasks).filter { $0.state == "running" }.count }
 
     init() {
@@ -623,7 +678,13 @@ struct ModelsPanel: View {
                         .labelStyle(.iconOnly).buttonStyle(.borderless).controlSize(.small).help("Edit \(provider.label)")
                     Toggle(isOn: Binding(get: { provider.enabled }, set: { _ in store.toggle(provider) })) {
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(provider.label).font(.callout)
+                            HStack(spacing: 4) {
+                                Text(provider.label).font(.callout)
+                                if let used = store.projectUsage[provider.id], let total = used.total, total > 0 {
+                                    Text(formatTokens(total)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                                        .help("Tokens used by this model across this project's runs: " + used.detail)
+                                }
+                            }
                             Text("→ " + provider.fallback.joined(separator: " → "))
                                 .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                         }
@@ -851,6 +912,9 @@ struct RunView: View {
                               systemImage: verify.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
                             .font(.caption).foregroundStyle(verify.passed ? .green : .red)
                     }
+                    if let usage = run.usage, !usage.isEmpty {
+                        UsageTable(rows: usage, providers: store.providers)
+                    }
                     if let outside = run.outsideChanges, !outside.isEmpty {
                         Label("Project files changed outside the harness during this run (by an agent or you): "
                               + outside.joined(separator: ", ") + ". Check them before applying.",
@@ -929,6 +993,9 @@ struct TaskRow: View {
                     Label(formatDuration(task.started, task.ended), systemImage: "clock")
                 }
                 if let changed = task.changedFiles { Label("\(changed) files", systemImage: "doc") }
+                if let usage = task.usage, let total = usage.total, total > 0 {
+                    Label(formatTokens(total), systemImage: "number").help("Tokens: " + usage.detail)
+                }
                 if let owned = task.ownedPaths { Text(owned.joined(separator: ", ")).lineLimit(1) }
             }
             .font(.caption)
@@ -943,6 +1010,41 @@ struct TaskRow: View {
             }
         }
         .padding(.vertical, 3)
+    }
+}
+
+struct UsageTable: View {
+    let rows: [ProviderUsage]
+    let providers: [ProviderInfo]
+
+    func label(_ id: String) -> String { providers.first { $0.id == id }?.label ?? id }
+
+    var body: some View {
+        let sum = rows.map(\.usage).reduce(Usage(), +)
+        DisclosureGroup {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 3) {
+                GridRow {
+                    Text("Model"); Text("Calls").gridColumnAlignment(.trailing)
+                    Text("Tokens").gridColumnAlignment(.trailing); Text("Cost").gridColumnAlignment(.trailing)
+                }
+                .foregroundStyle(.secondary)
+                ForEach(rows, id: \.provider) { row in
+                    GridRow {
+                        Text(label(row.provider))
+                        Text("\(row.calls)")
+                        Text(formatTokens(row.total ?? 0)).monospacedDigit()
+                        Text(row.costUsd.map { String(format: "$%.2f", $0) } ?? "–")
+                    }
+                    .help(row.usage.detail)
+                }
+            }
+            .font(.caption)
+            .padding(.top, 4)
+        } label: {
+            Label("Tokens \(formatTokens(sum.total ?? 0))" + (sum.costUsd.map { String(format: " · $%.2f", $0) } ?? ""),
+                  systemImage: "number")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 

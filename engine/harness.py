@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -344,7 +345,7 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
         return cmd, None
     if provider == "antigravity":
         cmd = ["agy", "-p", prompt, "--mode", "accept-edits" if write else "plan",
-               "--print-timeout", f"{timeout_min}m"]
+               "--print-timeout", f"{timeout_min}m", "--output-format", "json"]
         if model:
             cmd += ["--model", model]
         # Headless agy auto-denies shell commands it cannot prompt for. "skip_permissions" auto-approves
@@ -416,20 +417,24 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         cmd, stdin_text = provider_command(provider, pcfg, mode, workdir, prompt, message_file, timeout_min)
         run.set_task(task, provider=provider, log=log_rel)
         run.event(f"{base_name}: {pcfg.get('label', provider)} started")
-        stream = ClaudeStream() if provider == "claude" else None
+        stream = ClaudeStream() if provider == "claude" else AgyJson() if provider == "antigravity" else None
+        call_started = now()
         code = run_process(run, cmd, stdin_text, workdir, run.dir / log_rel, timeout_min * 60,
                            stream.line if stream else None)
         run.check_stop()  # some CLIs exit 0 when killed; never treat a stopped call as success
         if stream and stream.result is not None:
             message_file.write_text(stream.result)
         output = ANSI_RE.sub("", (run.dir / log_rel).read_text(errors="replace"))
+        usage = parse_usage(provider, output, stream, workdir, call_started)
+        if usage:
+            record_usage(run, task, provider, usage)
         status = "timeout" if code == 124 else classify_failure(code, output)
         result = ""
         if status == "ok":
             result = message_file.read_text(errors="replace") if message_file.exists() else output
             if not result.strip():
                 status = "no-output"
-        attempt = {"provider": provider, "status": status, "exit": code, "log": log_rel}
+        attempt = {"provider": provider, "status": status, "exit": code, "log": log_rel, "usage": usage}
         run.set_task(task, attempts=task["attempts"] + [attempt])
         if status == "ok":
             result_rel = f"results/{base_name}.result.md"
@@ -488,6 +493,7 @@ class ClaudeStream:
 
     def __init__(self) -> None:
         self.result: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
 
     def line(self, raw: str) -> Optional[str]:
         try:
@@ -511,6 +517,9 @@ class ClaudeStream:
             return "\n".join(parts) or None
         if kind == "result":
             self.result = str(ev.get("result") or "")
+            u = ev.get("usage") or {}
+            self.usage = make_usage(u.get("input_tokens"), u.get("output_tokens"), u.get("cache_read_input_tokens"),
+                                    u.get("cache_creation_input_tokens"), cost=ev.get("total_cost_usd"))
             head = "[done]"
             if ev.get("is_error"):  # keep subtype/errors/status so classify_failure can spot limits (e.g. error_max_budget_usd, 429)
                 details = [str(ev.get("subtype") or ""), *map(str, ev.get("errors") or [])]
@@ -521,6 +530,100 @@ class ClaudeStream:
             meta = f" {ev.get('num_turns', '?')} turns" + (f", ${cost:.2f}" if isinstance(cost, (int, float)) else "")
             return f"{head}{meta}\n{self.result}"
         return None
+
+
+class AgyJson:
+    """Reads `agy -p --output-format json` (one JSON object with response and usage);
+    other lines (stderr, warnings) pass through so failure detection still sees them."""
+
+    def __init__(self) -> None:
+        self.result: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
+
+    def line(self, raw: str) -> Optional[str]:
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.rstrip("\n") or None
+        if not isinstance(ev, dict) or "response" not in ev:
+            return raw.rstrip("\n") or None
+        u = ev.get("usage") or {}
+        self.usage = make_usage(u.get("input_tokens"), u.get("output_tokens"), u.get("cache_read_tokens"),
+                                total=u.get("total_tokens"))
+        self.result = str(ev.get("response") or "")
+        status = str(ev.get("status") or "")
+        return (f"[{status.lower()}]\n" if status and status != "SUCCESS" else "") + self.result
+
+
+CODEX_TOKENS_RE = re.compile(r"(?im)^\s*tokens used\s*:?\s*\n?\s*([\d,]+)\s*$")
+
+
+def make_usage(inp: Any = None, out: Any = None, cache_read: Any = None, cache_write: Any = None,
+               total: Any = None, cost: Any = None) -> Optional[Dict[str, Any]]:
+    def num(v: Any) -> int:
+        return int(v) if isinstance(v, (int, float)) else 0
+    usage = {"input": num(inp), "output": num(out), "cache_read": num(cache_read), "cache_write": num(cache_write)}
+    usage["total"] = num(total) or sum(usage.values())
+    if isinstance(cost, (int, float)):
+        usage["cost_usd"] = round(float(cost), 6)
+    return usage if usage["total"] else None
+
+
+def opencode_usage(workdir: Path, started: float) -> Optional[Dict[str, Any]]:
+    """OpenCode prints no usage in text mode; sum the sessions it stored for this call's directory
+    (subagent sessions included). Best effort: its database schema is internal."""
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    db = data_home / "opencode" / "opencode.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "select sum(tokens_input), sum(tokens_output + tokens_reasoning), sum(tokens_cache_read), "
+                "sum(tokens_cache_write), sum(cost) from session where directory = ? and time_created >= ?",
+                (str(workdir), int(started * 1000) - 5000)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if not row or row[0] is None:
+        return None
+    return make_usage(row[0], row[1], row[2], row[3], cost=row[4] or None)
+
+
+def parse_usage(provider: str, output: str, stream: Any, workdir: Path, started: float) -> Optional[Dict[str, Any]]:
+    if stream is not None and getattr(stream, "usage", None):
+        return stream.usage
+    if provider in ("sol", "luna"):
+        found = CODEX_TOKENS_RE.findall(output)
+        return make_usage(total=int(found[-1].replace(",", ""))) if found else None
+    if provider == "kimi":
+        return opencode_usage(workdir, started)
+    return None
+
+
+USAGE_FIELDS = ("input", "output", "cache_read", "cache_write", "total", "cost_usd")
+
+
+def record_usage(run: "Run", task: Dict[str, Any], provider: str, usage: Dict[str, Any]) -> None:
+    """Adds one call's usage to the task and to the run's per-provider totals."""
+    with run.lock:
+        task_usage = task.get("usage") or {}
+        for key in USAGE_FIELDS:
+            if key in usage:
+                task_usage[key] = round(task_usage.get(key, 0) + usage[key], 6)
+        task["usage"] = task_usage
+        rows = run.data.setdefault("usage", [])
+        row = next((r for r in rows if r["provider"] == provider), None)
+        if row is None:
+            row = {"provider": provider, "calls": 0}
+            rows.append(row)
+        row["calls"] += 1
+        for key in USAGE_FIELDS:
+            if key in usage:
+                row[key] = round(row.get(key, 0) + usage[key], 6)
+        run.save()
 
 
 def kill_group(proc: subprocess.Popen) -> None:
@@ -1113,6 +1216,12 @@ def cmd_status(args: argparse.Namespace) -> None:
               f"{(str(secs) + 's') if secs is not None else '-':<7} {t.get('changed_files') if t.get('changed_files') is not None else '-'}")
     for e in state["events"][-5:]:
         print(f"  {dt.datetime.fromtimestamp(e['t']):%H:%M:%S} {e['msg']}")
+    if state.get("usage"):
+        print(f"\n{'PROVIDER':<14} {'CALLS':>5} {'TOTAL':>12} {'INPUT':>11} {'OUTPUT':>10} {'CACHE READ':>12} {'COST':>8}")
+        for u in state["usage"]:
+            cost = f"${u['cost_usd']:.2f}" if u.get("cost_usd") is not None else "-"
+            print(f"{u['provider']:<14} {u['calls']:>5} {u.get('total', 0):>12,} {u.get('input', 0):>11,} "
+                  f"{u.get('output', 0):>10,} {u.get('cache_read', 0):>12,} {cost:>8}")
     report = runs_dir(repo_root(args.repo)) / state["id"] / (state.get("report") or "")
     if state.get("report") and report.is_file():
         print("\n" + report.read_text(errors="replace").rstrip())

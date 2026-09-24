@@ -38,6 +38,19 @@
 - Antigravity는 헤드리스 모드에서 셸 명령을 자동 거부합니다. `providers.antigravity.skip_permissions: true`로 모든 도구를 자동 승인할 수 있습니다(`--dangerously-skip-permissions`). 이때 `--sandbox`는 쓰지 않습니다(sandbox 안에서는 명령이 멈춤). 에이전트가 확인·격리 없이 셸 명령을 실행하므로 신뢰하는 프로젝트에서만 켜세요.
 - 설정 파일은 `~/.ai-harness/config.json`입니다. 모델, on/off, fallback 순서, `max_rounds`, `max_workers`, `call_timeout_minutes`, `summary_role`(빈 문자열이면 요약 끔)을 여기서 바꿉니다.
 
+## 토큰 사용량
+
+호출마다 AI별 토큰 사용량을 기록합니다. 앱의 run 화면에서 Tokens를 펼치면 모델별 호출 수·토큰·비용이, 작업 행에는 호출별 토큰이, Models 패널에는 이 프로젝트 전체 누적량이 보입니다. CLI는 `status`로 확인합니다.
+
+| 모델 | 출처 | 제공 항목 |
+|---|---|---|
+| Claude | stream-json `result` 이벤트 | 입력·출력·캐시·비용(USD) |
+| Codex (sol, luna) | 출력 끝의 `tokens used` | 합계만 |
+| OpenCode Kimi | OpenCode 세션 DB(`~/.local/share/opencode/opencode.db`) | 입력·출력·캐시 |
+| Antigravity | `--output-format json`의 `usage` | 입력·출력·캐시 |
+
+직접 추가한 AI는 사용량을 알 수 없어 표시되지 않습니다.
+
 ## 다른 AI 추가
 
 앱의 Models 패널에서 `+`로 에이전트 CLI를 추가하고, 연필 버튼으로 이름·모델·fallback 순서를 수정합니다(기본 모델은 삭제 불가). 설정은 `~/.ai-harness/config.json`에 저장되며 직접 편집해도 됩니다.
