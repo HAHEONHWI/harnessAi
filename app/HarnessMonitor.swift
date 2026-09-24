@@ -58,6 +58,7 @@ struct RunState: Decodable, Identifiable, Equatable {
     let report: String?
     let verify: VerifyResult?
     let completed: Bool?
+    let outsideChanges: [String]?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
@@ -849,6 +850,12 @@ struct RunView: View {
                         Label("\(verify.command): \(verify.passed ? "passed" : "failed (exit \(verify.exit))") in round \(verify.round)",
                               systemImage: verify.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
                             .font(.caption).foregroundStyle(verify.passed ? .green : .red)
+                    }
+                    if let outside = run.outsideChanges, !outside.isEmpty {
+                        Label("Project files changed outside the harness during this run (by an agent or you): "
+                              + outside.joined(separator: ", ") + ". Check them before applying.",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.red).textSelection(.enabled)
                     }
                     if let feedback = run.feedback, run.status == "ready" {
                         Text("Unresolved: \(feedback)").font(.caption).foregroundStyle(.orange)
