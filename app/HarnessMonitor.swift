@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import SwiftUI
+import UserNotifications
 
 // MARK: - Engine state (written by scripts/ai-harness/harness.py)
 
@@ -131,6 +132,51 @@ enum Files {
     }
 }
 
+// MARK: - Notifications
+
+/// Posts a macOS notification when a run finishes; clicking it selects that run.
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+    var onOpen: ((_ repo: String, _ runId: String) -> Void)?
+
+    func setUp() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func runFinished(_ run: RunState, repo: String) {
+        let content = UNMutableNotificationContent()
+        switch run.status {
+        case "failed": content.title = "Run failed"
+        case _ where run.allDone: content.title = "All done"
+        default: content.title = "Finished with unresolved work"
+        }
+        let files = run.finalFiles?.count ?? 0
+        let detail = run.status == "failed" ? (run.error ?? "") : (files > 0 ? "\(files) files ready to apply" : "No file changes")
+        content.subtitle = String(run.command.prefix(80))
+        content.body = [detail, run.summary ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+        content.sound = .default
+        content.userInfo = ["repo": repo, "run": run.id]
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: run.id, content: content, trigger: nil))
+    }
+
+    // Show banners even while the app is in front.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content.userInfo
+        if let repo = info["repo"] as? String, let run = info["run"] as? String {
+            DispatchQueue.main.async { self.onOpen?(repo, run) }
+        }
+        completionHandler()
+    }
+}
+
 // MARK: - Engine bridge
 
 enum Engine {
@@ -223,6 +269,7 @@ final class HarnessStore: ObservableObject {
             UserDefaults.standard.set(recentRepos, forKey: "recentRepos")
             selectedRun = nil
             runs = []
+            lastStatus = [:]
             refresh()
         }
     }
@@ -235,6 +282,8 @@ final class HarnessStore: ObservableObject {
 
     private var timer: Timer?
     private var refreshing = false
+    /// Last seen status per run, to notify only on an active -> finished transition (not for old runs at launch).
+    private var lastStatus: [String: String] = [:]
 
     var runsDir: URL { URL(fileURLWithPath: repoPath).appendingPathComponent(".ai-harness/runs") }
     var current: RunState? { runs.first { $0.id == selectedRun } }
@@ -248,7 +297,25 @@ final class HarnessStore: ObservableObject {
             Task { @MainActor in self?.refresh() }
         }
         Engine.bootstrap { [weak self] in self?.refresh() }
+        Notifier.shared.setUp()
+        Notifier.shared.onOpen = { [weak self] repo, run in
+            guard let self else { return }
+            if self.repoPath != repo { self.repoPath = repo }
+            self.selectedRun = run
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("main") ?? false }?.makeKeyAndOrderFront(nil)
+        }
         refresh()
+    }
+
+    private func notifyFinished(_ runs: [RunState]) {
+        for run in runs {
+            if let previous = lastStatus[run.id], RunState.activeStatuses.contains(previous),
+               run.isFinished || run.status == "failed" {
+                Notifier.shared.runFinished(run, repo: repoPath)
+            }
+            lastStatus[run.id] = run.status
+        }
     }
 
     func refresh() {
@@ -268,6 +335,7 @@ final class HarnessStore: ObservableObject {
             await MainActor.run {
                 self.refreshing = false
                 if self.runsDir != dir { return }
+                self.notifyFinished(runs)
                 if self.runs != runs { self.runs = runs }
                 if self.providers != providers { self.providers = providers }
                 self.engineInstalled = installed
