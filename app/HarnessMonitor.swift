@@ -60,6 +60,10 @@ struct RunState: Decodable, Identifiable, Equatable {
         return kill(pid, 0) == 0 || errno == EPERM
     }
     var isActive: Bool { Self.activeStatuses.contains(status) && engineAlive }
+    /// Failed, stopped, or the engine died mid-run.
+    var canRetry: Bool {
+        status == "failed" || status == "stopped" || (Self.activeStatuses.contains(status) && !engineAlive)
+    }
     var displayStatus: String {
         Self.activeStatuses.contains(status) && !engineAlive ? "\(status) (engine gone)" : status
     }
@@ -549,6 +553,13 @@ struct RunView: View {
                         if run.status == "ready" {
                             Button("Apply to project", systemImage: "arrow.down.doc") { confirmApply = true }
                                 .buttonStyle(.borderedProminent)
+                        }
+                        if run.canRetry {
+                            Button("Retry", systemImage: "arrow.clockwise") {
+                                store.start(command: run.command, rounds: run.maxRounds, paths: run.scope ?? [])
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("Start a new run with the same command, scope, and rounds")
                         }
                         Button("Show in Finder", systemImage: "folder") {
                             store.reveal(store.runsDir.appendingPathComponent(run.id))
