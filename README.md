@@ -51,6 +51,17 @@
 
 직접 추가한 AI는 사용량을 알 수 없어 표시되지 않습니다.
 
+## 벤치마크
+
+하네스와 단일 AI(GPT, Claude 등)를 같은 문제로 비교합니다. 문제마다 숨긴 채점 테스트가 있어 정답률, 시간, 토큰, 비용을 표로 냅니다.
+
+```bash
+python3 engine/harness.py bench validate
+python3 engine/harness.py bench --arms harness,sol,claude --trials 3
+```
+
+문제 목록과 추가 방법은 [bench/README.md](bench/README.md)를 보세요.
+
 ## 다른 AI 추가
 
 앱의 Models 패널에서 `+`로 에이전트 CLI를 추가하고, 연필 버튼으로 이름·모델·fallback 순서를 수정합니다(기본 모델은 삭제 불가). 설정은 `~/.ai-harness/config.json`에 저장되며 직접 편집해도 됩니다.

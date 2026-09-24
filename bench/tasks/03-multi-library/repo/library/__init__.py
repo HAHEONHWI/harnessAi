@@ -1,0 +1,1 @@
+"""Tiny library management system."""

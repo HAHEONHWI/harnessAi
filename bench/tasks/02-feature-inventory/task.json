@@ -1,0 +1,8 @@
+{
+  "title": "Add features to an inventory class (medium, one module)",
+  "size": "medium",
+  "scope": ["inventory.py", "tests"],
+  "visible_test": "python3 -m unittest discover -s tests -t tests -q",
+  "hidden_count": 15,
+  "command": "Extend the Inventory class in inventory.py. Keep existing behavior and signatures.\n1. low_stock(threshold) -> list of SKUs whose quantity is strictly below threshold, sorted by quantity ascending, then SKU.\n2. import_csv(text) -> list[str]. text is CSV with header `sku,name,qty,price` (extra surrounding whitespace in cells is ignored). Each valid row is applied like add(). Invalid rows are skipped and reported as `line N: <reason>` where N is the 1-based line number in the text (the header is line 1). A row is invalid if a field is missing or empty, qty is not a non-negative integer, price is not a non-negative number, or the SKU already exists with a different name. Blank lines are ignored. Return the error list (empty when all rows are valid).\n3. undo() -> bool: revert the most recent successful add(), remove() or import_csv() (an import is undone as a whole, and is not recorded at all if it applied no rows). Repeated calls go further back. Returns False when there is nothing to undo.\n4. to_json() -> str and classmethod from_json(text) -> Inventory that round-trip all items (sku, name, qty, price). Undo history is not saved.\n5. total_value() returns the sum of qty*price rounded to 2 decimals (it currently ignores quantity)."
+}
