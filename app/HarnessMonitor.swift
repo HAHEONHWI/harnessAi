@@ -56,6 +56,7 @@ struct RunState: Decodable, Identifiable, Equatable {
     let summary: String?
     let report: String?
     let verify: VerifyResult?
+    let completed: Bool?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
@@ -68,6 +69,9 @@ struct RunState: Decodable, Identifiable, Equatable {
         return kill(pid, 0) == 0 || errno == EPERM
     }
     var isActive: Bool { Self.activeStatuses.contains(status) && engineAlive }
+    var isFinished: Bool { ["ready", "no-changes", "applied"].contains(status) }
+    /// Review said done and verification (if any) passed.
+    var allDone: Bool { isFinished && completed == true && verify?.passed != false }
     /// Failed, stopped, or the engine died mid-run.
     var canRetry: Bool {
         status == "failed" || status == "stopped" || (Self.activeStatuses.contains(status) && !engineAlive)
@@ -536,6 +540,9 @@ struct RunView: View {
         if let run = store.current {
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 8) {
+                    if run.isFinished {
+                        CompletionBanner(run: run) { selectedTask = nil }
+                    }
                     Text(run.command).font(.headline).textSelection(.enabled)
                     HStack(spacing: 12) {
                         StatusBadge(status: run.displayStatus)
@@ -589,6 +596,7 @@ struct RunView: View {
                     ForEach(run.tasks) { task in TaskRow(task: task).tag(task.name) }
                 }
             }
+            .onChange(of: run.report) { if run.report != nil { selectedTask = nil } }
             .confirmationDialog(
                 "Apply \(run.finalFiles?.count ?? 0) changed files to \(URL(fileURLWithPath: store.repoPath).lastPathComponent)?",
                 isPresented: $confirmApply
@@ -644,6 +652,69 @@ struct TaskRow: View {
     }
 }
 
+struct CompletionBanner: View {
+    let run: RunState
+    let showSummary: () -> Void
+
+    var detail: String {
+        let files = run.finalFiles?.count ?? 0
+        switch run.status {
+        case "applied": return "\(files) files applied to the project"
+        case "no-changes": return "No file changes"
+        default: return "\(files) files ready to apply"
+        }
+    }
+
+    var body: some View {
+        let color: Color = run.allDone ? .green : .orange
+        HStack(spacing: 10) {
+            Image(systemName: run.allDone ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                .font(.title2).foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(run.allDone ? "All done" : "Finished with unresolved work").font(.headline)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if run.report != nil {
+                Button("Summary", systemImage: "doc.text", action: showSummary).controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Renders the summary report: headings, bullets, and inline Markdown per line.
+struct MarkdownView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { _, raw in
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("#") {
+                    inline(line.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces))
+                        .font(line.hasPrefix("##") ? .headline : .title3.bold()).padding(.top, 6)
+                } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•")
+                        inline(String(line.dropFirst(2)))
+                    }
+                    .padding(.leading, raw.prefix(while: { $0 == " " }).count >= 2 ? 16 : 0)
+                } else if !line.isEmpty {
+                    inline(raw)
+                }
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    func inline(_ s: String) -> Text {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return Text((try? AttributedString(markdown: s, options: options)) ?? AttributedString(s))
+    }
+}
+
 struct FileTabsView: View {
     let runDir: URL
     let tabs: [(String, String?)]
@@ -691,12 +762,18 @@ struct FileTabsView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 0) {
-                            Text(text.map { $0.isEmpty ? "(empty)" : $0 } ?? "(not created yet)")
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(text == nil ? .secondary : .primary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(12)
+                            Group {
+                                if tabs[tab].0 == "Summary", let text, !text.isEmpty {
+                                    MarkdownView(text: text).font(.body)
+                                } else {
+                                    Text(text.map { $0.isEmpty ? "(empty)" : $0 } ?? "(not created yet)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(text == nil ? .secondary : .primary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
                             Color.clear.frame(height: 1).id("bottom")
                         }
                     }
