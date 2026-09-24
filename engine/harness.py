@@ -170,8 +170,8 @@ def ensure_runs_ignored(repo: Path) -> None:
         fh.write("\n/.ai-harness/runs/\n")
 
 
-def snapshot(repo: Path, run_id: str) -> str:
-    """Commit the working tree (tracked + untracked, minus ignored) without touching HEAD/index."""
+def worktree_tree(repo: Path) -> Tuple[str, bool]:
+    """Tree of the working tree (tracked + untracked, minus ignored) without touching HEAD/index."""
     fd, index = tempfile.mkstemp(prefix="ai-harness-index-")
     os.close(fd)
     os.unlink(index)
@@ -185,10 +185,23 @@ def snapshot(repo: Path, run_id: str) -> str:
     finally:
         if os.path.exists(index):
             os.unlink(index)
+    return tree, has_head
+
+
+def snapshot(repo: Path, run_id: str) -> str:
+    """Commit the working tree without touching HEAD/index."""
+    tree, has_head = worktree_tree(repo)
     parent = ["-p", "HEAD"] if has_head else []
     sha = git(repo, *GIT_IDENT, "commit-tree", tree, *parent, "-m", f"ai-harness snapshot {run_id}")
     git(repo, "update-ref", f"refs/ai-harness/{run_id}", sha)
     return sha
+
+
+def changed_since(repo: Path, base: str) -> List[str]:
+    """Project files that differ from the run's snapshot (edits made outside the harness)."""
+    tree, _ = worktree_tree(repo)
+    return [p for p in git(repo, "diff", "--name-only", f"{base}^{{tree}}", tree).splitlines()
+            if p and not p.startswith(".ai-harness/")]
 
 
 def project_config(repo: Path) -> Dict[str, Any]:
@@ -843,6 +856,20 @@ def run_worker(run: Run, task: Dict[str, Any], plan: Dict[str, Any], worker: Dic
             git(run.repo, "worktree", "remove", "--force", str(worktree), check=False)
 
 
+def check_outside_changes(run: Run, round_no: int) -> None:
+    """Workers must only touch their worktrees; warn when the real project changed during the run."""
+    try:
+        changed = changed_since(run.repo, run.data["base"])
+    except HarnessError:
+        return
+    known = set(run.data.get("outside_changes") or [])
+    new = [p for p in changed if p not in known]
+    if new:
+        run.update(outside_changes=sorted(known | set(new)))
+        run.event(f"round {round_no}: WARNING project files changed outside the harness "
+                  f"(an agent or you edited the real checkout): {', '.join(new[:10])}")
+
+
 def coordinator_call(run: Run, name: str, kind: str, workdir: Path, build_prompt, validate=None) -> Dict[str, Any]:
     error = None
     for attempt in (1, 2):
@@ -894,6 +921,7 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
     for thread in threads:
         thread.join()
     run.check_stop()
+    check_outside_changes(run, round_no)
 
     reviewable = [t for t in tasks if t["state"] == "done" and t.get("changed_files")]
     security = None
@@ -1106,6 +1134,14 @@ def cmd_apply(args: argparse.Namespace) -> None:
     if subprocess.run(["git", "-C", str(repo), "apply", "--check", str(patch)], capture_output=True).returncode == 0:
         git(repo, "apply", str(patch))
     else:
+        drifted = [p for p in changed_since(repo, state["base"]) if p in set(state.get("final_files") or [])]
+        if drifted:
+            ref = f"refs/ai-harness/{state['id']}"
+            raise HarnessError(
+                "these files changed in the project after the run started, so final.patch no longer fits:\n  "
+                + "\n  ".join(drifted)
+                + f"\nKeep a copy if you need those edits, restore the snapshot version, then apply again:\n"
+                f"  git restore --source={ref} --worktree -- " + " ".join(drifted))
         git(repo, "apply", "--3way", str(patch))
         print("Applied with 3-way merge; files are staged. Resolve any conflict markers.")
     write_json(run_dir / "state.json", {**state, "status": "applied", "applied_at": now()})
