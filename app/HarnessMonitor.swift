@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import SwiftUI
+import UserNotifications
 
 // MARK: - Engine state (written by scripts/ai-harness/harness.py)
 
@@ -30,6 +31,13 @@ struct TaskState: Decodable, Identifiable, Equatable {
     var id: String { name }
 }
 
+struct VerifyResult: Decodable, Equatable {
+    let command: String
+    let round: Int
+    let passed: Bool
+    let exit: Int
+}
+
 struct EventItem: Decodable, Equatable {
     let t: Double
     let msg: String
@@ -47,18 +55,28 @@ struct RunState: Decodable, Identifiable, Equatable {
     let ended: Double?
     let error: String?
     let summary: String?
+    let report: String?
+    let verify: VerifyResult?
+    let completed: Bool?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
     let events: [EventItem]
 
-    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating"]
+    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "verifying", "summarizing"]
 
     var engineAlive: Bool {
         guard let pid else { return false }
         return kill(pid, 0) == 0 || errno == EPERM
     }
     var isActive: Bool { Self.activeStatuses.contains(status) && engineAlive }
+    var isFinished: Bool { ["ready", "no-changes", "applied"].contains(status) }
+    /// Review said done and verification (if any) passed.
+    var allDone: Bool { isFinished && completed == true && verify?.passed != false }
+    /// Failed, stopped, or the engine died mid-run.
+    var canRetry: Bool {
+        status == "failed" || status == "stopped" || (Self.activeStatuses.contains(status) && !engineAlive)
+    }
     var displayStatus: String {
         Self.activeStatuses.contains(status) && !engineAlive ? "\(status) (engine gone)" : status
     }
@@ -74,7 +92,7 @@ struct ProviderInfo: Identifiable, Equatable {
 
 func statusColor(_ status: String) -> Color {
     switch status {
-    case "ready", "done", "integrated": .green
+    case "ready", "done", "integrated", "passed": .green
     case "applied": .blue
     case "no-changes", "pending", "rejected": .secondary
     case "failed", "stopped", "conflict", "out-of-scope": .red
@@ -84,7 +102,7 @@ func statusColor(_ status: String) -> Color {
 
 func statusSymbol(_ status: String) -> String {
     switch status {
-    case "ready", "done", "integrated": "checkmark.circle.fill"
+    case "ready", "done", "integrated", "passed": "checkmark.circle.fill"
     case "applied": "arrow.down.doc.fill"
     case "no-changes", "pending": "circle.dashed"
     case "rejected": "minus.circle"
@@ -111,6 +129,51 @@ enum Files {
         try? handle.seek(toOffset: size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0)
         let text = String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self)
         return ansi.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+    }
+}
+
+// MARK: - Notifications
+
+/// Posts a macOS notification when a run finishes; clicking it selects that run.
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+    var onOpen: ((_ repo: String, _ runId: String) -> Void)?
+
+    func setUp() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func runFinished(_ run: RunState, repo: String) {
+        let content = UNMutableNotificationContent()
+        switch run.status {
+        case "failed": content.title = "Run failed"
+        case _ where run.allDone: content.title = "All done"
+        default: content.title = "Finished with unresolved work"
+        }
+        let files = run.finalFiles?.count ?? 0
+        let detail = run.status == "failed" ? (run.error ?? "") : (files > 0 ? "\(files) files ready to apply" : "No file changes")
+        content.subtitle = String(run.command.prefix(80))
+        content.body = [detail, run.summary ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+        content.sound = .default
+        content.userInfo = ["repo": repo, "run": run.id]
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: run.id, content: content, trigger: nil))
+    }
+
+    // Show banners even while the app is in front.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content.userInfo
+        if let repo = info["repo"] as? String, let run = info["run"] as? String {
+            DispatchQueue.main.async { self.onOpen?(repo, run) }
+        }
+        completionHandler()
     }
 }
 
@@ -206,6 +269,7 @@ final class HarnessStore: ObservableObject {
             UserDefaults.standard.set(recentRepos, forKey: "recentRepos")
             selectedRun = nil
             runs = []
+            lastStatus = [:]
             refresh()
         }
     }
@@ -218,6 +282,8 @@ final class HarnessStore: ObservableObject {
 
     private var timer: Timer?
     private var refreshing = false
+    /// Last seen status per run, to notify only on an active -> finished transition (not for old runs at launch).
+    private var lastStatus: [String: String] = [:]
 
     var runsDir: URL { URL(fileURLWithPath: repoPath).appendingPathComponent(".ai-harness/runs") }
     var current: RunState? { runs.first { $0.id == selectedRun } }
@@ -231,7 +297,25 @@ final class HarnessStore: ObservableObject {
             Task { @MainActor in self?.refresh() }
         }
         Engine.bootstrap { [weak self] in self?.refresh() }
+        Notifier.shared.setUp()
+        Notifier.shared.onOpen = { [weak self] repo, run in
+            guard let self else { return }
+            if self.repoPath != repo { self.repoPath = repo }
+            self.selectedRun = run
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("main") ?? false }?.makeKeyAndOrderFront(nil)
+        }
         refresh()
+    }
+
+    private func notifyFinished(_ runs: [RunState]) {
+        for run in runs {
+            if let previous = lastStatus[run.id], RunState.activeStatuses.contains(previous),
+               run.isFinished || run.status == "failed" {
+                Notifier.shared.runFinished(run, repo: repoPath)
+            }
+            lastStatus[run.id] = run.status
+        }
     }
 
     func refresh() {
@@ -251,6 +335,7 @@ final class HarnessStore: ObservableObject {
             await MainActor.run {
                 self.refreshing = false
                 if self.runsDir != dir { return }
+                self.notifyFinished(runs)
                 if self.runs != runs { self.runs = runs }
                 if self.providers != providers { self.providers = providers }
                 self.engineInstalled = installed
@@ -371,9 +456,9 @@ struct ContentView: View {
                     .id(name)
                 } else {
                     FileTabsView(runDir: store.runsDir.appendingPathComponent(run.id), tabs: [
-                        ("Events", nil), ("Final patch", "final.patch"), ("Engine log", "engine.log"),
-                    ], events: run.events)
-                    .id(run.id)
+                        ("Summary", run.report), ("Events", nil), ("Final patch", "final.patch"), ("Engine log", "engine.log"),
+                    ], events: run.events, initialTab: run.report == nil ? 1 : 0)
+                    .id("\(run.id)-\(run.report != nil)")
                 }
             } else {
                 ContentUnavailableView("Select a run", systemImage: "cpu")
@@ -523,6 +608,9 @@ struct RunView: View {
         if let run = store.current {
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 8) {
+                    if run.isFinished {
+                        CompletionBanner(run: run) { selectedTask = nil }
+                    }
                     Text(run.command).font(.headline).textSelection(.enabled)
                     HStack(spacing: 12) {
                         StatusBadge(status: run.displayStatus)
@@ -538,6 +626,11 @@ struct RunView: View {
                     if let text = run.error ?? run.summary {
                         Text(text).font(.callout).foregroundStyle(run.error != nil ? .red : .primary).textSelection(.enabled)
                     }
+                    if let verify = run.verify {
+                        Label("\(verify.command): \(verify.passed ? "passed" : "failed (exit \(verify.exit))") in round \(verify.round)",
+                              systemImage: verify.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
+                            .font(.caption).foregroundStyle(verify.passed ? .green : .red)
+                    }
                     if let feedback = run.feedback, run.status == "ready" {
                         Text("Unresolved: \(feedback)").font(.caption).foregroundStyle(.orange)
                     }
@@ -548,6 +641,13 @@ struct RunView: View {
                         if run.status == "ready" {
                             Button("Apply to project", systemImage: "arrow.down.doc") { confirmApply = true }
                                 .buttonStyle(.borderedProminent)
+                        }
+                        if run.canRetry {
+                            Button("Retry", systemImage: "arrow.clockwise") {
+                                store.start(command: run.command, rounds: run.maxRounds, paths: run.scope ?? [])
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("Start a new run with the same command, scope, and rounds")
                         }
                         Button("Show in Finder", systemImage: "folder") {
                             store.reveal(store.runsDir.appendingPathComponent(run.id))
@@ -564,6 +664,7 @@ struct RunView: View {
                     ForEach(run.tasks) { task in TaskRow(task: task).tag(task.name) }
                 }
             }
+            .onChange(of: run.report) { if run.report != nil { selectedTask = nil } }
             .confirmationDialog(
                 "Apply \(run.finalFiles?.count ?? 0) changed files to \(URL(fileURLWithPath: store.repoPath).lastPathComponent)?",
                 isPresented: $confirmApply
@@ -619,12 +720,82 @@ struct TaskRow: View {
     }
 }
 
+struct CompletionBanner: View {
+    let run: RunState
+    let showSummary: () -> Void
+
+    var detail: String {
+        let files = run.finalFiles?.count ?? 0
+        switch run.status {
+        case "applied": return "\(files) files applied to the project"
+        case "no-changes": return "No file changes"
+        default: return "\(files) files ready to apply"
+        }
+    }
+
+    var body: some View {
+        let color: Color = run.allDone ? .green : .orange
+        HStack(spacing: 10) {
+            Image(systemName: run.allDone ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                .font(.title2).foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(run.allDone ? "All done" : "Finished with unresolved work").font(.headline)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if run.report != nil {
+                Button("Summary", systemImage: "doc.text", action: showSummary).controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Renders the summary report: headings, bullets, and inline Markdown per line.
+struct MarkdownView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { _, raw in
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("#") {
+                    inline(line.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces))
+                        .font(line.hasPrefix("##") ? .headline : .title3.bold()).padding(.top, 6)
+                } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•")
+                        inline(String(line.dropFirst(2)))
+                    }
+                    .padding(.leading, raw.prefix(while: { $0 == " " }).count >= 2 ? 16 : 0)
+                } else if !line.isEmpty {
+                    inline(raw)
+                }
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    func inline(_ s: String) -> Text {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return Text((try? AttributedString(markdown: s, options: options)) ?? AttributedString(s))
+    }
+}
+
 struct FileTabsView: View {
     let runDir: URL
     let tabs: [(String, String?)]
     var events: [EventItem] = []
-    @State private var tab = 0
+    @State private var tab: Int
     @State private var follow = true
+
+    init(runDir: URL, tabs: [(String, String?)], events: [EventItem] = [], initialTab: Int = 0) {
+        self.runDir = runDir
+        self.tabs = tabs
+        self.events = events
+        _tab = State(initialValue: initialTab)
+    }
 
     func content() -> String? {
         let (title, path) = tabs[tab]
@@ -659,17 +830,23 @@ struct FileTabsView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 0) {
-                            Text(text.map { $0.isEmpty ? "(empty)" : $0 } ?? "(not created yet)")
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(text == nil ? .secondary : .primary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(12)
+                            Group {
+                                if tabs[tab].0 == "Summary", let text, !text.isEmpty {
+                                    MarkdownView(text: text).font(.body)
+                                } else {
+                                    Text(text.map { $0.isEmpty ? "(empty)" : $0 } ?? "(not created yet)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(text == nil ? .secondary : .primary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
                             Color.clear.frame(height: 1).id("bottom")
                         }
                     }
-                    .onChange(of: text) { if follow { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
-                    .onAppear { if follow { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                    .onChange(of: text) { if follow && tabs[tab].0 != "Summary" { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                    .onAppear { if follow && tabs[tab].0 != "Summary" { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
                 }
             }
         }
