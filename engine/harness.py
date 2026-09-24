@@ -9,7 +9,14 @@ writes report.md explaining the result.
 
 Every model call goes through a fallback chain; when a provider hits a usage,
 quota, or rate limit (or is disabled/missing), the next provider is tried.
-Provider on/off and chains live in ~/.ai-harness/config.json.
+Provider on/off and chains live in ~/.ai-harness/config.json. Besides the
+built-in providers, any CLI can be added there as a custom provider:
+  "providers": {"gemini": {"label": "Gemini CLI", "enabled": true, "model": "",
+      "command": ["gemini", "-p", "{prompt}"], "write_args": ["--yolo"], "notes": "..."}}
+Placeholders {prompt}, {model}, {workdir}, {message_file} are filled per call;
+"stdin": true sends the prompt on stdin instead. "read_args"/"write_args" are
+appended for read-only/editing calls, and "worker": false keeps the coordinator
+from assigning it work (it can still be a fallback).
 """
 from __future__ import annotations
 
@@ -53,7 +60,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "summary_role": "luna",  # writes report.md after a run; "" disables it
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
-WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")
+WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
+PLACEHOLDER_RE = re.compile(r"\{(prompt|model|workdir|message_file)\}")
 COORDINATOR = "claude"  # plans and reviews every round
 
 # GUI apps start with a minimal PATH; make the agent CLIs reachable.
@@ -110,6 +118,23 @@ def load_config() -> Dict[str, Any]:
         if key in user:
             cfg[key] = user[key]
     return cfg
+
+
+def is_custom(name: str, pcfg: Optional[Dict[str, Any]]) -> bool:
+    return name not in PROVIDER_CLI and bool(pcfg)
+
+
+def provider_cli(name: str, pcfg: Dict[str, Any]) -> str:
+    if name in PROVIDER_CLI:
+        return PROVIDER_CLI[name]
+    command = pcfg.get("command") or []
+    return str(command[0]) if command else ""
+
+
+def worker_roles(cfg: Dict[str, Any]) -> List[str]:
+    custom = sorted(n for n, p in cfg["providers"].items()
+                    if is_custom(n, p) and NAME_RE.match(n) and p.get("command") and p.get("worker", True))
+    return list(WORKER_ROLES) + custom
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -316,7 +341,21 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
         elif write:
             cmd.append("--sandbox")
         return cmd, None
-    raise HarnessError(f"unknown provider {provider}")
+    command = cfg.get("command")
+    if not isinstance(command, list) or not command:
+        raise HarnessError(f"provider {provider} has no command configured")
+    values = {"prompt": prompt, "model": model, "workdir": str(workdir), "message_file": str(message_file)}
+    use_stdin = bool(cfg.get("stdin"))
+    extra = cfg.get("write_args" if write else "read_args") or []
+    cmd = []
+    for arg in [str(a) for a in command + list(extra)]:
+        if arg == "{model}" and not model:
+            # drop an empty model value together with the flag right before it (e.g. "--model", "{model}")
+            if cmd and cmd[-1].startswith("-"):
+                cmd.pop()
+            continue
+        cmd.append(PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], arg))
+    return cmd, prompt if use_stdin else None
 
 
 def classify_failure(code: int, output: str) -> str:
@@ -350,8 +389,10 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
             skip = "disabled"
         elif provider in run.exhausted:
             skip = "limit or no output earlier in this run"
-        elif not shutil.which(PROVIDER_CLI[provider]):
-            skip = f"{PROVIDER_CLI[provider]} not installed"
+        elif not provider_cli(provider, pcfg):
+            skip = "no command configured"
+        elif not shutil.which(provider_cli(provider, pcfg)):
+            skip = f"{provider_cli(provider, pcfg)} not installed"
         if skip:
             run.set_task(task, attempts=task["attempts"] + [{"provider": provider, "status": "skipped", "reason": skip}])
             continue
@@ -493,9 +534,11 @@ def role_guide(cfg: Dict[str, Any]) -> str:
         "sol": "Codex Sol: strongest Codex, expensive. Hard design or security-critical code.",
     }
     lines = []
-    for role in WORKER_ROLES:
-        state = "on" if cfg["providers"].get(role, {}).get("enabled") else "off (auto-replaced by fallback)"
-        lines.append(f"- {role} [{state}]: {notes[role]}")
+    for role in worker_roles(cfg):
+        pcfg = cfg["providers"].get(role, {})
+        state = "on" if pcfg.get("enabled") else "off (auto-replaced by fallback)"
+        note = notes.get(role) or f"{pcfg.get('label', role)}: {pcfg.get('notes') or 'custom agent CLI.'}"
+        lines.append(f"- {role} [{state}]: {note}")
     return "\n".join(lines)
 
 
@@ -674,8 +717,9 @@ Base every claim on the patch and the notes above; do not invent changes. Reply 
 
 
 def write_report(run: Run, integration: Path, final: str, files: List[str], review: Dict[str, Any]) -> None:
-    role = str(load_config().get("summary_role") or "")
-    if role not in PROVIDER_CLI:
+    cfg = load_config()
+    role = str(cfg.get("summary_role") or "")
+    if role not in cfg["providers"]:
         return
     run.update(status="summarizing")
     task = run.add_task(name="summary", kind="summary", round=run.data["round"], role=role)
@@ -698,6 +742,7 @@ def write_report(run: Run, integration: Path, final: str, files: List[str], revi
 def validate_plan(plan: Dict[str, Any], workdir: Path, max_workers: int, scope: List[str]) -> None:
     if plan.get("done"):
         return
+    roles = worker_roles(load_config())
     workers = plan.get("workers")
     if not isinstance(workers, list) or not 1 <= len(workers) <= max_workers:
         raise HarnessError(f"plan needs 1-{max_workers} workers")
@@ -708,7 +753,7 @@ def validate_plan(plan: Dict[str, Any], workdir: Path, max_workers: int, scope: 
         if not NAME_RE.match(name) or name in names:
             raise HarnessError(f"invalid or duplicate worker name: {name!r}")
         names.add(name)
-        if w.get("role") not in WORKER_ROLES:
+        if w.get("role") not in roles:
             raise HarnessError(f"{name}: unknown role {w.get('role')!r}")
         if not str(w.get("assignment", "")).strip():
             raise HarnessError(f"{name}: empty assignment")

@@ -37,6 +37,27 @@
 - Antigravity는 헤드리스 모드에서 셸 명령을 자동 거부합니다. `providers.antigravity.skip_permissions: true`로 모든 도구를 자동 승인할 수 있습니다(`--dangerously-skip-permissions`). 이때 `--sandbox`는 쓰지 않습니다(sandbox 안에서는 명령이 멈춤). 에이전트가 확인·격리 없이 셸 명령을 실행하므로 신뢰하는 프로젝트에서만 켜세요.
 - 설정 파일은 `~/.ai-harness/config.json`입니다. 모델, on/off, fallback 순서, `max_rounds`, `max_workers`, `call_timeout_minutes`, `summary_role`(빈 문자열이면 요약 끔)을 여기서 바꿉니다.
 
+## 다른 AI 추가
+
+앱의 Models 패널에서 `+`로 에이전트 CLI를 추가하고, 연필 버튼으로 이름·모델·fallback 순서를 수정합니다(기본 모델은 삭제 불가). 설정은 `~/.ai-harness/config.json`에 저장되며 직접 편집해도 됩니다.
+
+```json
+"providers": {
+  "gemini": {
+    "label": "Gemini CLI", "enabled": true, "model": "",
+    "command": ["gemini", "-p", "{prompt}", "--model", "{model}"],
+    "read_args": ["--approval-mode", "plan"], "write_args": ["--yolo"],
+    "stdin": false, "worker": true, "notes": "빠르고 저렴. 문서·반복 작업"
+  }
+},
+"fallback": { "gemini": ["kimi", "claude"] }
+```
+
+- `{prompt}` `{model}` `{workdir}` `{message_file}`은 호출마다 채워집니다. 모델이 비어 있으면 `{model}`과 바로 앞의 플래그를 뺍니다. `stdin: true`면 프롬프트를 표준 입력으로 보냅니다.
+- `read_args`는 계획·리뷰·요약 같은 읽기 호출에, `write_args`는 워커 수정 호출에 붙습니다. 하네스는 추가한 CLI의 읽기 전용 여부를 강제할 수 없으므로 그 CLI의 옵션을 넣으세요. 워커는 격리된 worktree에서 실행되고 경로 검사는 그대로 적용됩니다.
+- 결과는 CLI가 출력한 내용이며, `{message_file}`에 쓰면 그 파일을 사용합니다.
+- `worker: true`면 조율자가 `notes`를 보고 작업을 배정할 수 있습니다. 다른 모델의 fallback이나 `summary_role`로도 쓸 수 있습니다.
+
 ## 설치
 
 필요 조건:

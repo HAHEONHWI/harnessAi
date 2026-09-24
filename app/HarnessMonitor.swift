@@ -83,11 +83,50 @@ struct RunState: Decodable, Identifiable, Equatable {
 }
 
 struct ProviderInfo: Identifiable, Equatable {
+    static let builtins = ["sol", "luna", "kimi", "claude", "antigravity"]
     let id: String
     let label: String
     let model: String
     let enabled: Bool
     let fallback: [String]
+    var builtin: Bool { Self.builtins.contains(id) }
+}
+
+/// Editable copy of one provider entry in ~/.ai-harness/config.json.
+struct ProviderDraft {
+    var id = ""
+    var label = ""
+    var model = ""
+    var effort = ""
+    var command = ""
+    var readArgs = ""
+    var writeArgs = ""
+    var stdin = false
+    var worker = true
+    var notes = ""
+    var fallback: [String] = []
+
+    /// Splits a shell-like line into arguments; single/double quotes group words.
+    static func split(_ line: String) -> [String] {
+        var args: [String] = [], current = "", quote: Character? = nil, has = false
+        for ch in line {
+            if let q = quote {
+                if ch == q { quote = nil } else { current.append(ch) }
+            } else if ch == "\"" || ch == "'" {
+                quote = ch; has = true
+            } else if ch == " " || ch == "\t" {
+                if has || !current.isEmpty { args.append(current); current = ""; has = false }
+            } else {
+                current.append(ch)
+            }
+        }
+        if has || !current.isEmpty { args.append(current) }
+        return args
+    }
+
+    static func join(_ args: [String]) -> String {
+        args.map { $0.isEmpty || $0.contains(where: { " \t\"'".contains($0) }) ? "'\($0)'" : $0 }.joined(separator: " ")
+    }
 }
 
 func statusColor(_ status: String) -> Color {
@@ -234,7 +273,8 @@ enum Engine {
         let json = readConfig()
         let providers = json["providers"] as? [String: [String: Any]] ?? [:]
         let fallback = json["fallback"] as? [String: [String]] ?? [:]
-        return ["sol", "luna", "kimi", "claude", "antigravity"].compactMap { id in
+        let custom = providers.keys.filter { !ProviderInfo.builtins.contains($0) }.sorted()
+        return (ProviderInfo.builtins + custom).compactMap { id in
             guard let p = providers[id] else { return nil }
             return ProviderInfo(
                 id: id,
@@ -251,8 +291,64 @@ enum Engine {
         var providers = json["providers"] as? [String: [String: Any]] ?? [:]
         providers[id, default: [:]]["enabled"] = enabled
         json["providers"] = providers
+        writeConfig(json)
+    }
+
+    static func writeConfig(_ json: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return }
         try? data.write(to: config, options: .atomic)
+    }
+
+    static func draft(_ id: String) -> ProviderDraft {
+        let json = readConfig()
+        let p = (json["providers"] as? [String: [String: Any]])?[id] ?? [:]
+        let strings = { (key: String) in (p[key] as? [Any] ?? []).map { "\($0)" } }
+        return ProviderDraft(
+            id: id, label: p["label"] as? String ?? id, model: p["model"] as? String ?? "",
+            effort: p["effort"] as? String ?? "", command: ProviderDraft.join(strings("command")),
+            readArgs: ProviderDraft.join(strings("read_args")), writeArgs: ProviderDraft.join(strings("write_args")),
+            stdin: p["stdin"] as? Bool ?? false, worker: p["worker"] as? Bool ?? true, notes: p["notes"] as? String ?? "",
+            fallback: (json["fallback"] as? [String: [String]])?[id] ?? []
+        )
+    }
+
+    /// Writes the draft back, keeping keys the editor does not know about (e.g. max_budget_usd).
+    static func save(_ d: ProviderDraft) {
+        var json = readConfig()
+        var providers = json["providers"] as? [String: [String: Any]] ?? [:]
+        var p = providers[d.id] ?? ["enabled": true]
+        p["label"] = d.label.isEmpty ? d.id : d.label
+        p["model"] = d.model
+        if ProviderInfo.builtins.contains(d.id) {
+            if !d.effort.isEmpty { p["effort"] = d.effort }
+        } else {
+            p["command"] = ProviderDraft.split(d.command)
+            p["read_args"] = ProviderDraft.split(d.readArgs)
+            p["write_args"] = ProviderDraft.split(d.writeArgs)
+            p["stdin"] = d.stdin
+            p["worker"] = d.worker
+            p["notes"] = d.notes
+        }
+        providers[d.id] = p
+        var fallback = json["fallback"] as? [String: [String]] ?? [:]
+        fallback[d.id] = d.fallback
+        json["providers"] = providers
+        json["fallback"] = fallback
+        writeConfig(json)
+    }
+
+    static func delete(_ id: String) {
+        guard !ProviderInfo.builtins.contains(id) else { return }
+        var json = readConfig()
+        var providers = json["providers"] as? [String: [String: Any]] ?? [:]
+        providers[id] = nil
+        var fallback = json["fallback"] as? [String: [String]] ?? [:]
+        fallback[id] = nil
+        for key in fallback.keys { fallback[key]?.removeAll { $0 == id } }
+        json["providers"] = providers
+        json["fallback"] = fallback
+        if json["summary_role"] as? String == id { json["summary_role"] = "luna" }
+        writeConfig(json)
     }
 }
 
@@ -501,30 +597,153 @@ struct ContentView: View {
     }
 }
 
+struct EditTarget: Identifiable {
+    let id: String?  // nil = new provider
+}
+
 struct ModelsPanel: View {
     @EnvironmentObject var store: HarnessStore
+    @State private var editing: EditTarget?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Models").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            HStack {
+                Text("Models").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Button("Add model", systemImage: "plus") { editing = EditTarget(id: nil) }
+                    .labelStyle(.iconOnly).buttonStyle(.borderless).controlSize(.small).help("Add an agent CLI")
+            }
             if store.providers.isEmpty {
                 Text("Run build.sh to install the engine.").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(store.providers) { provider in
-                Toggle(isOn: Binding(get: { provider.enabled }, set: { _ in store.toggle(provider) })) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(provider.label).font(.callout)
-                        Text("→ " + provider.fallback.joined(separator: " → "))
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                HStack(spacing: 4) {
+                    Button("Edit", systemImage: "pencil") { editing = EditTarget(id: provider.id) }
+                        .labelStyle(.iconOnly).buttonStyle(.borderless).controlSize(.small).help("Edit \(provider.label)")
+                    Toggle(isOn: Binding(get: { provider.enabled }, set: { _ in store.toggle(provider) })) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(provider.label).font(.callout)
+                            Text("→ " + provider.fallback.joined(separator: " → "))
+                                .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
                 }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
+                .contextMenu { Button("Edit…") { editing = EditTarget(id: provider.id) } }
             }
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .sheet(item: $editing) { target in
+            ProviderEditor(original: target.id, draft: target.id.map(Engine.draft) ?? ProviderDraft())
+        }
+    }
+}
+
+struct ProviderEditor: View {
+    @EnvironmentObject var store: HarnessStore
+    @Environment(\.dismiss) private var dismiss
+    let original: String?
+    @State var draft: ProviderDraft
+    @State private var confirmDelete = false
+
+    var isBuiltin: Bool { original.map(ProviderInfo.builtins.contains) ?? false }
+    var others: [String] { store.providers.map(\.id).filter { $0 != draft.id && !draft.fallback.contains($0) } }
+    var idError: String? {
+        guard original == nil else { return nil }
+        if draft.id.range(of: "^[a-z0-9][a-z0-9-]{0,30}$", options: .regularExpression) == nil {
+            return "Lowercase letters, digits, and dashes only"
+        }
+        return store.providers.contains { $0.id == draft.id } ? "Already exists" : nil
+    }
+    var commandError: String? {
+        guard !isBuiltin else { return nil }
+        let args = ProviderDraft.split(draft.command)
+        if args.isEmpty { return "Required" }
+        if !draft.stdin && !args.contains(where: { $0.contains("{prompt}") }) { return "Include {prompt} or turn on stdin" }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(original == nil ? "Add Model" : "Edit \(draft.label)").font(.title2.weight(.semibold))
+            Form {
+                if original == nil {
+                    TextField("ID", text: $draft.id, prompt: Text("gemini"))
+                    if let idError, !draft.id.isEmpty { Text(idError).font(.caption).foregroundStyle(.red) }
+                }
+                TextField("Name", text: $draft.label, prompt: Text("Gemini CLI"))
+                TextField("Model", text: $draft.model, prompt: Text("(CLI default)"))
+                if isBuiltin {
+                    if ["sol", "luna", "claude"].contains(draft.id) {
+                        TextField("Effort", text: $draft.effort, prompt: Text("high"))
+                    }
+                } else {
+                    Section {
+                        TextField("Command", text: $draft.command, prompt: Text("gemini -p {prompt} --model {model}"))
+                            .font(.body.monospaced())
+                        if let commandError { Text(commandError).font(.caption).foregroundStyle(.red) }
+                        TextField("Read-only args", text: $draft.readArgs, prompt: Text("--approval-mode plan"))
+                            .font(.body.monospaced())
+                        TextField("Editing args", text: $draft.writeArgs, prompt: Text("--yolo")).font(.body.monospaced())
+                        Toggle("Send prompt on stdin", isOn: $draft.stdin)
+                        Toggle("Coordinator may assign work", isOn: $draft.worker)
+                        TextField("Notes for coordinator", text: $draft.notes, prompt: Text("Fast and cheap; docs and repetitive edits"))
+                    } footer: {
+                        Text("Placeholders: {prompt} {model} {workdir} {message_file}. Output is what the CLI prints, or {message_file} if it writes one. The CLI runs in an isolated worktree; the harness cannot enforce read-only mode, so pass the CLI's own flags.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section("Fallback order") {
+                    ForEach(Array(draft.fallback.enumerated()), id: \.element) { index, id in
+                        HStack {
+                            Text("\(index + 1). \(store.providers.first { $0.id == id }?.label ?? id)")
+                            Spacer()
+                            Button("Up", systemImage: "chevron.up") { draft.fallback.swapAt(index, index - 1) }
+                                .disabled(index == 0)
+                            Button("Remove", systemImage: "xmark") { draft.fallback.remove(at: index) }
+                        }
+                        .labelStyle(.iconOnly).buttonStyle(.borderless)
+                    }
+                    if !others.isEmpty {
+                        Menu("Add fallback") {
+                            ForEach(others, id: \.self) { id in
+                                Button(store.providers.first { $0.id == id }?.label ?? id) { draft.fallback.append(id) }
+                            }
+                        }
+                        .fixedSize()
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            HStack {
+                if original != nil && !isBuiltin {
+                    Button("Delete", role: .destructive) { confirmDelete = true }
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    Engine.save(draft)
+                    store.refresh()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(idError != nil || commandError != nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 520, height: isBuiltin ? 420 : 640)
+        .confirmationDialog("Delete \(draft.label)?", isPresented: $confirmDelete) {
+            Button("Delete", role: .destructive) {
+                Engine.delete(draft.id)
+                store.refresh()
+                dismiss()
+            }
+        } message: {
+            Text("It is also removed from other models' fallback order.")
+        }
     }
 }
 
