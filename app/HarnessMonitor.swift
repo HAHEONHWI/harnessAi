@@ -30,6 +30,13 @@ struct TaskState: Decodable, Identifiable, Equatable {
     var id: String { name }
 }
 
+struct VerifyResult: Decodable, Equatable {
+    let command: String
+    let round: Int
+    let passed: Bool
+    let exit: Int
+}
+
 struct EventItem: Decodable, Equatable {
     let t: Double
     let msg: String
@@ -48,12 +55,13 @@ struct RunState: Decodable, Identifiable, Equatable {
     let error: String?
     let summary: String?
     let report: String?
+    let verify: VerifyResult?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
     let events: [EventItem]
 
-    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "summarizing"]
+    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "verifying", "summarizing"]
 
     var engineAlive: Bool {
         guard let pid else { return false }
@@ -79,7 +87,7 @@ struct ProviderInfo: Identifiable, Equatable {
 
 func statusColor(_ status: String) -> Color {
     switch status {
-    case "ready", "done", "integrated": .green
+    case "ready", "done", "integrated", "passed": .green
     case "applied": .blue
     case "no-changes", "pending", "rejected": .secondary
     case "failed", "stopped", "conflict", "out-of-scope": .red
@@ -89,7 +97,7 @@ func statusColor(_ status: String) -> Color {
 
 func statusSymbol(_ status: String) -> String {
     switch status {
-    case "ready", "done", "integrated": "checkmark.circle.fill"
+    case "ready", "done", "integrated", "passed": "checkmark.circle.fill"
     case "applied": "arrow.down.doc.fill"
     case "no-changes", "pending": "circle.dashed"
     case "rejected": "minus.circle"
@@ -542,6 +550,11 @@ struct RunView: View {
                     }
                     if let text = run.error ?? run.summary {
                         Text(text).font(.callout).foregroundStyle(run.error != nil ? .red : .primary).textSelection(.enabled)
+                    }
+                    if let verify = run.verify {
+                        Label("\(verify.command): \(verify.passed ? "passed" : "failed (exit \(verify.exit))") in round \(verify.round)",
+                              systemImage: verify.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
+                            .font(.caption).foregroundStyle(verify.passed ? .green : .red)
                     }
                     if let feedback = run.feedback, run.status == "ready" {
                         Text("Unresolved: \(feedback)").font(.caption).foregroundStyle(.orange)

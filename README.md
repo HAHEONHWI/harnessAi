@@ -10,16 +10,17 @@
 ## 동작 방식
 
 ```
-명령 → 스냅샷 → Claude 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Claude 리뷰 → 통합 → 반복 → final.patch → 결과 요약 → Apply
+명령 → 스냅샷 → Claude 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Claude 리뷰 → 통합 → 검증 → 반복 → final.patch → 결과 요약 → Apply
 ```
 
 1. 현재 작업 트리(커밋 안 된 파일 포함)를 스냅샷으로 뜹니다. HEAD, index, stash는 건드리지 않습니다.
 2. 조율자(`claude`)가 작업을 1~4개로 나누고, 워커마다 겹치지 않는 수정 가능 경로를 정합니다.
 3. 워커는 각자 별도 `git worktree`에서 병렬로 실행됩니다. 허용 경로 밖을 수정한 patch는 보류됩니다.
 4. 보안 관련 변경이면 Claude가 patch를 리뷰합니다.
-5. 조율자가 승인한 patch만 전용 통합 worktree에 반영하고, 필요하면 다음 라운드를 진행합니다(기본 최대 3라운드).
-6. 결과는 `final.patch`로 남습니다. **Apply를 눌러야만 프로젝트 파일이 바뀝니다.**
-7. 요약 모델(`summary_role`, 기본 `luna`)이 최종 patch를 읽고 `report.md`를 씁니다: 결과, 변경 내용, 확인 방법, 남은 문제. 앱의 Summary 탭과 `status` 명령에서 볼 수 있습니다. 요약이 실패해도 patch는 그대로 적용할 수 있습니다.
+5. 조율자가 승인한 patch만 전용 통합 worktree에 반영합니다. 승인되지 않은 patch는 `rejected`로 표시됩니다.
+6. 프로젝트에 `verify_command`가 있으면 통합된 결과에서 실행합니다. 실패하면 출력이 다음 라운드 피드백으로 넘어가고, 리뷰가 완료라고 해도 끝나지 않습니다. 필요하면 다음 라운드를 진행합니다(기본 최대 3라운드).
+7. 결과는 `final.patch`로 남습니다. **Apply를 눌러야만 프로젝트 파일이 바뀝니다.**
+8. 요약 모델(`summary_role`, 기본 `luna`)이 최종 patch를 읽고 `report.md`를 씁니다: 결과, 변경 내용, 확인 방법, 남은 문제. 앱의 Summary 탭과 `status` 명령에서 볼 수 있습니다. 요약이 실패해도 patch는 그대로 적용할 수 있습니다.
 
 ## 역할과 fallback
 
@@ -85,11 +86,17 @@ $harness config kimi off
 
 ## 프로젝트별 설정
 
-프로젝트에 `.ai-harness/config.json`을 두면 에이전트가 수정할 수 없는 경로를 추가할 수 있습니다.
+프로젝트에 `.ai-harness/config.json`을 두면 보호 경로와 검증 명령을 지정할 수 있습니다.
 
 ```json
-{ "protected_paths": ["templates", "output", ".local-settings.json"] }
+{
+  "protected_paths": ["templates", "output", ".local-settings.json"],
+  "verify_command": "npm ci && npm test"
+}
 ```
+
+- `protected_paths`: 에이전트가 수정할 수 없는 경로.
+- `verify_command`: 매 라운드 통합 후 결과를 검증하는 셸 명령(`zsh -lc`). 종료 코드 0이면 통과입니다. 통합 worktree에는 커밋되지 않은 의존성(`node_modules` 등)이 없으므로 설치 단계를 명령에 포함하세요. 검증이 만든 추적 파일은 patch에 들어가지 않도록 되돌립니다.
 
 `.git`, `.env*`, `.ai-harness`, `.ssh`, `.aws`, `node_modules` 등은 항상 보호됩니다. run 기록은 `.ai-harness/runs/`에 저장되며, 엔진이 이 경로를 `.git/info/exclude`에 자동으로 추가합니다.
 
