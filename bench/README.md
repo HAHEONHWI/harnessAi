@@ -21,6 +21,8 @@ After an approach finishes, the hidden tests are copied in and run. Results go t
 | 02-feature-inventory | medium | several features in one class (CSV import with errors, undo, JSON) |
 | 03-multi-library | large | four features across modules (search, fines, reservation holds, reports) |
 | 04-rework-pricing | medium | exact money rules with Decimal (bulk tiers, coupons, tax, shipping) |
+| 05-spreadsheet-engine | hard | formula parser, precedence, lazy IF, error propagation, cycles, 3000-cell chains |
+| 06-mini-sql | hard | SQL lexer/parser/executor: joins, GROUP BY/HAVING, NULL logic, ORDER BY rules |
 
 ## Adding a task
 
