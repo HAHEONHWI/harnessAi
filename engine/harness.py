@@ -1460,6 +1460,8 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
         state = json.loads((runs[-1] / "state.json").read_text()) if runs else {}
         result.update(status=state.get("status", "failed"), error=state.get("error"), usage=state.get("usage") or [],
                       rounds=state.get("round"), completed=state.get("completed"))
+        result["limited"] = sorted({a["provider"] for t in state.get("tasks", []) for a in t.get("attempts", [])
+                                    if a.get("status") == "limit"})
         if state.get("status") == "ready":
             applied = subprocess.run([sys.executable, str(Path(__file__).resolve()), "apply", "--repo", str(repo), state["id"]],
                                      capture_output=True, text=True)
@@ -1480,6 +1482,7 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
             run.update(status="failed", error=str(exc), ended=now())
             result["error"] = str(exc)
         result["usage"] = run.data.get("usage") or []
+        result["limited"] = sorted({a["provider"] for a in agent_task.get("attempts", []) if a.get("status") == "limit"})
     result["seconds"] = round(now() - started, 1)
     result["diff"] = diff_stats(repo, scope)
     code, out = run_shell(task["visible_test"], repo, int(task.get("test_timeout_seconds", 300)))
@@ -1581,6 +1584,15 @@ def cmd_bench(args: argparse.Namespace) -> None:
     for i, (task, arm, trial) in enumerate(todo, 1):
         print(f"[{i}/{len(todo)}] {task['id']} / {arm} / trial {trial} ...", flush=True)
         result = bench_trial(task, arm, trial, work, args)
+        if result.get("limited"):
+            # A usage limit changes who does the work (fallbacks) or fails the call outright: not a fair sample.
+            aside_path = out / "limited-results.json"
+            aside = json.loads(aside_path.read_text()) if aside_path.exists() else []
+            aside.append(result)
+            write_json(aside_path, aside)
+            Path(result["repo"]).rename(Path(result["repo"] + f"-limited-{len(aside)}"))
+            raise HarnessError(f"usage limit hit on {', '.join(result['limited'])} during {task['id']} / {arm}; "
+                               f"trial set aside. Rerun the same command with --out {out} after the limit resets.")
         results.append(result)
         write_json(results_path, results)
         h = result["hidden"]
