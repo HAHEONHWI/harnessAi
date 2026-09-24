@@ -409,18 +409,19 @@ final class HarnessStore: ObservableObject {
     @Published var repoPath: String {
         didSet {
             UserDefaults.standard.set(repoPath, forKey: "repoPath")
-            var recent = recentRepos.filter { $0 != repoPath }
-            recent.insert(repoPath, at: 0)
-            recentRepos = Array(recent.prefix(8))
-            UserDefaults.standard.set(recentRepos, forKey: "recentRepos")
+            if !recentRepos.contains(repoPath) {
+                recentRepos = Array(([repoPath] + recentRepos).prefix(30))
+                UserDefaults.standard.set(recentRepos, forKey: "recentRepos")
+            }
             selectedRun = nil
-            runs = []
-            lastStatus = [:]
+            runs = allRuns[repoPath] ?? []
             refresh()
         }
     }
     @Published var recentRepos: [String]
     @Published var runs: [RunState] = []
+    /// Runs of every project in the sidebar, keyed by project path.
+    @Published var allRuns: [String: [RunState]] = [:]
     @Published var selectedRun: String?
     @Published var providers: [ProviderInfo] = []
     @Published var message: String?
@@ -428,7 +429,8 @@ final class HarnessStore: ObservableObject {
 
     private var timer: Timer?
     private var refreshing = false
-    /// Last seen status per run, to notify only on an active -> finished transition (not for old runs at launch).
+    /// Last seen status per project path + run id, to notify only on an active -> finished transition
+    /// (not for old runs at launch).
     private var lastStatus: [String: String] = [:]
 
     var runsDir: URL { URL(fileURLWithPath: repoPath).appendingPathComponent(".ai-harness/runs") }
@@ -452,42 +454,63 @@ final class HarnessStore: ObservableObject {
         Notifier.shared.setUp()
         Notifier.shared.onOpen = { [weak self] repo, run in
             guard let self else { return }
-            if self.repoPath != repo { self.repoPath = repo }
-            self.selectedRun = run
+            self.open(repo: repo, run: run)
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("main") ?? false }?.makeKeyAndOrderFront(nil)
         }
         refresh()
     }
 
-    private func notifyFinished(_ runs: [RunState]) {
-        for run in runs {
-            if let previous = lastStatus[run.id], RunState.activeStatuses.contains(previous),
-               run.isFinished || run.status == "failed" {
-                Notifier.shared.runFinished(run, repo: repoPath)
+    private func notifyFinished(_ all: [String: [RunState]]) {
+        for (repo, runs) in all {
+            for run in runs {
+                let key = repo + "\u{1F}" + run.id
+                if let previous = lastStatus[key], RunState.activeStatuses.contains(previous),
+                   run.isFinished || run.status == "failed" {
+                    Notifier.shared.runFinished(run, repo: repo)
+                }
+                lastStatus[key] = run.status
             }
-            lastStatus[run.id] = run.status
+        }
+    }
+
+    /// Selects a run, switching projects when needed.
+    func open(repo: String, run: String?) {
+        if repoPath != repo { repoPath = repo }
+        selectedRun = run ?? runs.first?.id
+    }
+
+    func removeProject(_ path: String) {
+        recentRepos.removeAll { $0 == path }
+        UserDefaults.standard.set(recentRepos, forKey: "recentRepos")
+        allRuns[path] = nil
+        if repoPath == path, let next = recentRepos.first { repoPath = next }
+    }
+
+    nonisolated static func loadRuns(_ repo: String) -> [RunState] {
+        let dir = URL(fileURLWithPath: repo).appendingPathComponent(".ai-harness/runs")
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted(by: >)
+        return ids.compactMap { id in
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("\(id)/state.json")) else { return nil }
+            return try? decoder.decode(RunState.self, from: data)
         }
     }
 
     func refresh() {
         guard !refreshing else { return }
         refreshing = true
-        let dir = runsDir
+        let repos = Array(Set(recentRepos + [repoPath]))
         Task.detached(priority: .utility) {
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted(by: >)
-            let runs: [RunState] = ids.compactMap { id in
-                guard let data = try? Data(contentsOf: dir.appendingPathComponent("\(id)/state.json")) else { return nil }
-                return try? decoder.decode(RunState.self, from: data)
-            }
+            let all = Dictionary(uniqueKeysWithValues: repos.map { ($0, Self.loadRuns($0)) })
             let providers = Engine.providers()
             let installed = FileManager.default.fileExists(atPath: Engine.script.path)
             await MainActor.run {
                 self.refreshing = false
-                if self.runsDir != dir { return }
-                self.notifyFinished(runs)
+                self.notifyFinished(all)
+                if self.allRuns != all { self.allRuns = all }
+                let runs = all[self.repoPath] ?? []
                 if self.runs != runs { self.runs = runs }
                 if self.providers != providers { self.providers = providers }
                 self.engineInstalled = installed
@@ -577,25 +600,9 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(store.runs, selection: $store.selectedRun) { run in
-                HStack(spacing: 8) {
-                    Image(systemName: statusSymbol(run.displayStatus)).foregroundStyle(statusColor(run.displayStatus))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(run.command).lineLimit(2)
-                        Text(run.id.prefix(15) + " · " + run.displayStatus)
-                            .font(.caption.monospaced()).foregroundStyle(.secondary)
-                    }
-                }
-                .tag(run.id)
-            }
-            .navigationSplitViewColumnWidth(min: 250, ideal: 290)
-            .safeAreaInset(edge: .bottom) { ModelsPanel().padding(10) }
-            .overlay {
-                if store.runs.isEmpty {
-                    ContentUnavailableView("No runs yet", systemImage: "sparkles",
-                                           description: Text("Press New Task (⌘N) and describe what to build."))
-                }
-            }
+            ProjectSidebar(showNewTask: $showNewTask)
+                .navigationSplitViewColumnWidth(min: 250, ideal: 290)
+                .safeAreaInset(edge: .bottom) { ModelsPanel().padding(10) }
         } content: {
             RunView(selectedTask: $selectedTask)
                 .navigationSplitViewColumnWidth(min: 400, ideal: 480)
@@ -650,6 +657,104 @@ struct ContentView: View {
                     .onTapGesture { store.message = nil }
             }
         }
+    }
+}
+
+/// Projects as folders with their runs underneath; selecting a run switches project.
+struct ProjectSidebar: View {
+    @EnvironmentObject var store: HarnessStore
+    @Binding var showNewTask: Bool
+    @State private var collapsed: Set<String> = []
+    @State private var expandedAll: Set<String> = []
+    private let visibleRuns = 6
+    private static let sep: Character = "\u{1F}"
+
+    var selection: Binding<String?> {
+        Binding(
+            get: { store.selectedRun.map { store.repoPath + String(Self.sep) + $0 } },
+            set: { tag in
+                guard let tag, let cut = tag.lastIndex(of: Self.sep) else { return }
+                store.open(repo: String(tag[..<cut]), run: String(tag[tag.index(after: cut)...]))
+            }
+        )
+    }
+
+    func projectName(_ path: String) -> String { URL(fileURLWithPath: path).lastPathComponent }
+
+    var body: some View {
+        List(selection: selection) {
+            Text("Projects").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            ForEach(store.recentRepos, id: \.self) { path in
+                let runs = store.allRuns[path] ?? []
+                let showAll = expandedAll.contains(path)
+                Section(isExpanded: Binding(
+                    get: { !collapsed.contains(path) },
+                    set: { if $0 { collapsed.remove(path) } else { collapsed.insert(path) } }
+                )) {
+                    ForEach(showAll ? runs : Array(runs.prefix(visibleRuns))) { run in
+                        RunRow(run: run).tag(path + String(Self.sep) + run.id)
+                    }
+                    if runs.count > visibleRuns {
+                        Button(showAll ? "Show less" : "Show \(runs.count - visibleRuns) more") {
+                            if showAll { expandedAll.remove(path) } else { expandedAll.insert(path) }
+                        }
+                        .buttonStyle(.borderless).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if runs.isEmpty {
+                        Text("No runs yet").font(.caption).foregroundStyle(.tertiary)
+                    }
+                } header: {
+                    HStack(spacing: 6) {
+                        Image(systemName: path == store.repoPath ? "folder.fill" : "folder")
+                        Text(projectName(path)).lineLimit(1)
+                        Spacer()
+                        Button("New Task", systemImage: "plus") {
+                            store.open(repo: path, run: nil)
+                            showNewTask = true
+                        }
+                        .labelStyle(.iconOnly).buttonStyle(.borderless).help("New task in \(projectName(path))")
+                    }
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .help(path)
+                    .contentShape(Rectangle())
+                    .onTapGesture { store.open(repo: path, run: nil) }
+                    .contextMenu {
+                        Button("New Task…") { store.open(repo: path, run: nil); showNewTask = true }
+                        Button("Show in Finder") { store.reveal(URL(fileURLWithPath: path)) }
+                        Divider()
+                        Button("Remove from Sidebar") { store.removeProject(path) }
+                    }
+                }
+            }
+            Button("Add Project…", systemImage: "folder.badge.plus", action: store.chooseRepo)
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+        }
+        .listStyle(.sidebar)
+    }
+}
+
+struct RunRow: View {
+    let run: RunState
+
+    var title: String {
+        let first = run.command.split(whereSeparator: \.isNewline).first.map(String.init) ?? run.command
+        return first.trimmingCharacters(in: .whitespaces)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title).lineLimit(1)
+            Spacer(minLength: 4)
+            if run.isActive {
+                ProgressView().controlSize(.mini)
+            } else if run.status == "failed" || run.displayStatus.contains("engine gone") {
+                Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
+            } else if run.status == "ready" {
+                Circle().fill(.blue).frame(width: 7, height: 7).help("Ready to apply")
+            }
+        }
+        .help("\(run.command)\n\(run.id) · \(run.displayStatus)")
     }
 }
 
