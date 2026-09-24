@@ -1,0 +1,8 @@
+{
+  "title": "Fix bugs in a text statistics module (small, one file)",
+  "size": "small",
+  "scope": ["textstats.py"],
+  "visible_test": "python3 -m unittest discover -s tests -t tests -q",
+  "hidden_count": 16,
+  "command": "Users reported bugs in textstats.py. Fix all of them without changing function names or signatures:\n1. words(text): a word is a maximal run of Unicode letters or digits, optionally joined by a single ASCII apostrophe or hyphen between two such runs (\"don't\", \"state-of-the-art\", \"3-2\" are one word each). Non-ASCII words such as \"café\" and \"안녕하세요\" must be found. Underscores are not part of words.\n2. word_count(text) must equal len(words(text)); multiple spaces, tabs and newlines must not create extra words, and empty or whitespace-only text is 0.\n3. top_words(text, n=3) must be case-insensitive and return lowercase (word, count) tuples, most frequent first, ties ordered alphabetically; n <= 0 returns [].\n4. sentence_count(text): '.', '!' and '?' end a sentence, and a run of them (\"...\", \"?!\") counts once; trailing text without end punctuation is a sentence too; empty or whitespace-only text is 0.\n5. reading_time_seconds(text, wpm=200) returns an int, rounded up (0 for no words), and raises ValueError when wpm <= 0."
+}

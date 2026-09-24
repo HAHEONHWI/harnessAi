@@ -1,0 +1,8 @@
+{
+  "title": "Rework order pricing with exact money rules (medium, one module)",
+  "size": "medium",
+  "scope": ["pricing.py", "tests"],
+  "visible_test": "python3 -m unittest discover -s tests -t tests -q",
+  "hidden_count": 15,
+  "command": "Rework price_order in pricing.py. New signature: price_order(items, region, coupons=()); calls without coupons must keep working.\n- Money: use decimal.Decimal everywhere. Convert inputs with Decimal(str(value)) (they may be str, int, float or Decimal). Every returned amount is a Decimal quantized to 0.01 with ROUND_HALF_UP.\n- items: list of dicts {\"sku\", \"unit_price\", \"qty\"}. qty must be a positive int (bool is not allowed) and unit_price must be >= 0, otherwise raise ValueError.\n- Bulk discount per line: qty >= 50 gets 10% off the line, qty >= 10 gets 5% off. Each line total is rounded to cents after its discount. subtotal = sum of line totals.\n- coupons: dicts {\"type\": \"percent\", \"value\": 15} (percent off) or {\"type\": \"fixed\", \"value\": \"5.00\"} (amount off). At most one coupon of each type, and no other types (ValueError otherwise). Apply percent first (percent of subtotal, rounded to cents), then fixed on what remains. Coupons never take the amount below 0. discount = total coupon discount.\n- Tax rates: CA 7.25%, NY 8.875%, OR 0%, TX 6.25%; any other region raises ValueError. tax = rate * (subtotal - discount), rounded to cents.\n- Shipping: 0.00 when subtotal - discount >= 50.00 or when there are no items, otherwise 5.99.\n- Return {\"subtotal\", \"discount\", \"tax\", \"shipping\", \"total\"} where total = subtotal - discount + tax + shipping."
+}

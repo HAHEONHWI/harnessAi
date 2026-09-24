@@ -24,6 +24,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -324,7 +325,7 @@ class Run:
 
 def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Path, prompt: str,
                      message_file: Path, timeout_min: int) -> Tuple[List[str], Optional[str]]:
-    write = mode == "write"
+    write = mode in ("write", "solo")  # solo: one agent does the whole task and may run commands (bench)
     model = cfg.get("model") or ""
     if provider in ("sol", "luna"):
         cmd = ["codex", "exec", "--model", model, "-c", 'approval_policy="never"',
@@ -336,7 +337,7 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
         agent = "harness-kimi-writer" if write else "harness-kimi-reader"
         return ["opencode", "run", "--agent", agent, "--model", model, "--dir", str(workdir), prompt], None
     if provider == "claude":
-        tools = "Read,Glob,Grep,Edit,Write" if write else "Read,Glob,Grep"
+        tools = "Read,Glob,Grep,Edit,Write,Bash" if mode == "solo" else "Read,Glob,Grep,Edit,Write" if write else "Read,Glob,Grep"
         cmd = ["claude", "-p", prompt, "--model", model or "opus", "--effort", cfg.get("effort", "max"),
                "--output-format", "stream-json", "--verbose",
                "--permission-mode", "acceptEdits" if write else "plan", "--allowedTools", tools,
@@ -385,11 +386,12 @@ def classify_failure(code: int, output: str) -> str:
     return "ok" if code == 0 else "error"
 
 
-def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Path, prompt: str) -> str:
+def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Path, prompt: str,
+               fallback: bool = True, overrides: Optional[Dict[str, Any]] = None) -> str:
     base_name = task["name"]
     (run.dir / "prompts" / f"{base_name}.md").write_text(prompt)
     run.set_task(task, prompt=f"prompts/{base_name}.md", state="running", started=now())
-    chain = [role] + list(load_config()["fallback"].get(role, []))
+    chain = [role] + (list(load_config()["fallback"].get(role, [])) if fallback else [])
     seen: List[str] = []
     for provider in chain:
         run.check_stop()
@@ -398,6 +400,8 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         seen.append(provider)
         cfg = load_config()  # re-read so on/off toggles apply mid-run
         pcfg = cfg["providers"].get(provider)
+        if pcfg and overrides:
+            pcfg = {**pcfg, **overrides}
         skip = None
         if not pcfg or not pcfg.get("enabled", False):
             skip = "disabled"
@@ -1329,6 +1333,265 @@ def cmd_config(args: argparse.Namespace) -> None:
         print(f"{name:<12} {'on ' if p.get('enabled') else 'off'} {p.get('model') or '(default)':<40} fallback: {chain}")
 
 
+
+# ---------------------------------------------------------------------------
+# Benchmark: harness vs. single agents on tasks with hidden tests
+
+
+BENCH_DIR = HOME_DIR / "bench"
+HIDDEN_DIR = "_hidden_tests"
+
+
+def bench_tasks_dir(arg: Optional[str]) -> Path:
+    if arg:
+        return Path(arg).expanduser().resolve()
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent / "bench" / "tasks", here / "bench" / "tasks"):
+        if cand.is_dir():
+            return cand
+    raise HarnessError("benchmark tasks not found; pass --tasks <dir>")
+
+
+def load_bench_tasks(root: Path, only: List[str]) -> List[Dict[str, Any]]:
+    tasks = []
+    for d in sorted(p for p in root.iterdir() if (p / "task.json").exists()):
+        if only and d.name not in only:
+            continue
+        spec = json.loads((d / "task.json").read_text())
+        spec.update(id=d.name, dir=d)
+        tasks.append(spec)
+    missing = set(only) - {t["id"] for t in tasks}
+    if missing:
+        raise HarnessError(f"unknown task(s): {', '.join(sorted(missing))}")
+    if not tasks:
+        raise HarnessError(f"no tasks in {root}")
+    return tasks
+
+
+def bench_repo(task: Dict[str, Any], dest: Path, overlay: Optional[Path] = None) -> None:
+    """Fresh git repo with the task's starter files (plus an optional overlay such as the reference solution)."""
+    shutil.copytree(task["dir"] / "repo", dest)
+    if overlay:
+        shutil.copytree(overlay, dest, dirs_exist_ok=True)
+    git(dest, "init", "-q")
+    exclude = dest / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(f"/.ai-harness/\n/{HIDDEN_DIR}/\n__pycache__/\n")
+    (dest / ".ai-harness").mkdir(exist_ok=True)
+    write_json(dest / ".ai-harness" / "config.json", {"verify_command": task["visible_test"]})
+    git(dest, "add", "-A")
+    git(dest, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", "bench start")
+
+
+def run_shell(command: str, cwd: Path, timeout: int) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(["/bin/sh", "-c", command], cwd=str(cwd), capture_output=True, text=True,
+                              errors="replace", timeout=timeout, start_new_session=True)
+        return proc.returncode, proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        return 124, (out.decode(errors="replace") if isinstance(out, bytes) else out) + "\n[timed out]"
+
+
+def hidden_score(task: Dict[str, Any], repo: Path) -> Dict[str, Any]:
+    """Copy the hidden tests in only after the agent is done, run them, count passes."""
+    target = repo / HIDDEN_DIR
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(task["dir"] / "hidden", target)
+    code, out = run_shell(f"{shlex_quote(sys.executable)} -m unittest discover -s {HIDDEN_DIR} -t {HIDDEN_DIR} -v",
+                          repo, int(task.get("test_timeout_seconds", 300)))
+    shutil.rmtree(target, ignore_errors=True)
+    ran = re.search(r"^Ran (\d+) tests?", out, re.M)
+    # An import error shows up as a single failed "test"; never let it shrink the denominator.
+    total = max(int(ran.group(1)) if ran else 0, int(task.get("hidden_count", 0)))
+    failed = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", out.split("\nRan ")[-1])) if ran else total
+    passed = max(0, total - failed) if code != 124 else 0
+    return {"passed": passed, "total": total, "ok": bool(total) and passed == total, "exit": code, "tail": clip(out[-3000:], 3000)}
+
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def diff_stats(repo: Path, scope: List[str]) -> Dict[str, Any]:
+    git(repo, "add", "-A", "-N")
+    files = [f for f in git(repo, "diff", "--name-only", "HEAD").splitlines() if f]
+    added = removed = 0
+    for line in git(repo, "diff", "--numstat", "HEAD").splitlines():
+        a, r, _ = (line.split("\t") + ["", ""])[:3]
+        added += int(a) if a.isdigit() else 0
+        removed += int(r) if r.isdigit() else 0
+    outside = [f for f in files if scope and not in_scope(f, scope)]
+    return {"files": len(files), "added": added, "removed": removed, "outside_scope": outside}
+
+
+def solo_prompt(task: Dict[str, Any]) -> str:
+    scope = task.get("scope") or []
+    scope_text = f"\nOnly change these files/folders: {', '.join(scope)}\n" if scope else ""
+    return f"""You are working alone on this repository. Complete the task end to end.
+
+Task:
+{task['command']}
+{scope_text}
+Before finishing, run `{task['visible_test']}` and make it pass. Do not delete or weaken existing tests.
+{COMMON_RULES.replace("- Do not add or run tests unless the assignment says so.", "")}
+When finished, report changed files and the checks you ran."""
+
+
+def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: argparse.Namespace) -> Dict[str, Any]:
+    repo = work / f"{task['id']}-{arm}-{trial}"
+    shutil.rmtree(repo, ignore_errors=True)
+    bench_repo(task, repo)
+    scope = task.get("scope") or []
+    result: Dict[str, Any] = {"task": task["id"], "arm": arm, "trial": trial, "repo": str(repo),
+                              "status": "failed", "error": None, "usage": [], "rounds": None}
+    started = now()
+    if arm == "harness":
+        cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--repo", str(repo), "--slug", "bench"]
+        if args.rounds:
+            cmd += ["--rounds", str(args.rounds)]
+        for path in scope:
+            cmd += ["--path", path]
+        cmd += ["--", task["command"]]
+        with (work / f"{repo.name}.engine.log").open("w") as log:
+            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        runs = sorted(runs_dir(repo).iterdir()) if runs_dir(repo).exists() else []
+        state = json.loads((runs[-1] / "state.json").read_text()) if runs else {}
+        result.update(status=state.get("status", "failed"), error=state.get("error"), usage=state.get("usage") or [],
+                      rounds=state.get("round"), completed=state.get("completed"))
+        if state.get("status") == "ready":
+            applied = subprocess.run([sys.executable, str(Path(__file__).resolve()), "apply", "--repo", str(repo), state["id"]],
+                                     capture_output=True, text=True)
+            if applied.returncode != 0:
+                result.update(status="apply-failed", error=applied.stderr.strip())
+    else:
+        run = Run.create(repo, task["command"], f"solo-{arm}", 1, scope)
+        run.update(status="working", pid=os.getpid())
+        agent_task = run.add_task(name="solo", kind="solo", round=1, role=arm)
+        overrides = {"max_budget_usd": args.budget} if arm == "claude" else None
+        try:
+            call_agent(run, agent_task, arm, "solo", repo, solo_prompt(task), fallback=False, overrides=overrides)
+            run.set_task(agent_task, state="done", ended=now())
+            run.update(status="done", ended=now())
+            result["status"] = "done"
+        except HarnessError as exc:
+            run.set_task(agent_task, state="failed", error=str(exc), ended=now())
+            run.update(status="failed", error=str(exc), ended=now())
+            result["error"] = str(exc)
+        result["usage"] = run.data.get("usage") or []
+    result["seconds"] = round(now() - started, 1)
+    result["diff"] = diff_stats(repo, scope)
+    code, out = run_shell(task["visible_test"], repo, int(task.get("test_timeout_seconds", 300)))
+    result["visible_ok"] = code == 0
+    result["hidden"] = hidden_score(task, repo)
+    result["tokens"] = sum(u.get("total", 0) for u in result["usage"])
+    costs = [u["cost_usd"] for u in result["usage"] if u.get("cost_usd") is not None]
+    result["cost_usd"] = round(sum(costs), 4) if costs else None
+    return result
+
+
+def bench_summary(results: List[Dict[str, Any]]) -> str:
+    def mean(xs: List[float]) -> Optional[float]:
+        return sum(xs) / len(xs) if xs else None
+
+    def fmt_tokens(n: Optional[float]) -> str:
+        if n is None:
+            return "-"
+        return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else f"{n:.0f}"
+
+    def row(rs: List[Dict[str, Any]]) -> List[str]:
+        scores = [r["hidden"]["passed"] / r["hidden"]["total"] for r in rs if r["hidden"]["total"]]
+        solved = sum(1 for r in rs if r["hidden"]["ok"])
+        costs = [r["cost_usd"] for r in rs if r.get("cost_usd") is not None]
+        by_provider: Dict[str, float] = {}
+        for r in rs:
+            for u in r["usage"]:
+                by_provider[u["provider"]] = by_provider.get(u["provider"], 0) + u.get("total", 0)
+        mix = ", ".join(f"{p} {fmt_tokens(t / len(rs))}" for p, t in sorted(by_provider.items(), key=lambda x: -x[1]))
+        avg_score = mean(scores)
+        return [f"{solved}/{len(rs)}", f"{avg_score * 100:.0f}%" if avg_score is not None else "-",
+                f"{sum(1 for r in rs if r['visible_ok'])}/{len(rs)}",
+                f"{mean([r['seconds'] for r in rs]) / 60:.1f}m", fmt_tokens(mean([r["tokens"] for r in rs])),
+                f"${mean(costs):.2f}" if costs else "-", mix or "-"]
+
+    head = ["solved", "hidden tests", "visible ok", "time", "tokens", "cost*", "tokens by model"]
+    arms = list(dict.fromkeys(r["arm"] for r in results))
+    tasks = list(dict.fromkeys(r["task"] for r in results))
+    lines = ["## By approach (mean per trial)", "", "| approach | " + " | ".join(head) + " |", "|" + "---|" * (len(head) + 1)]
+    for arm in arms:
+        lines.append(f"| {arm} | " + " | ".join(row([r for r in results if r["arm"] == arm])) + " |")
+    lines += ["", "## By task", "", "| task | approach | " + " | ".join(head) + " |", "|" + "---|" * (len(head) + 2)]
+    for t in tasks:
+        for arm in arms:
+            rs = [r for r in results if r["task"] == t and r["arm"] == arm]
+            if rs:
+                lines.append(f"| {t} | {arm} | " + " | ".join(row(rs)) + " |")
+    lines += ["", "solved = every hidden test passed. hidden tests = mean share of hidden tests passed. "
+              "tokens = all calls incl. cache reads. *cost only where the CLI reports it (Claude); Codex reports a token total only."]
+    return "\n".join(lines)
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    if args.bench_cmd == "report":
+        out = Path(args.out).expanduser()
+        results = json.loads((out / "results.json").read_text())
+        print(bench_summary(results))
+        return
+    tasks = load_bench_tasks(bench_tasks_dir(args.tasks), args.task or [])
+    if args.bench_cmd == "validate":
+        bad = 0
+        with tempfile.TemporaryDirectory(prefix="ai-harness-bench-") as tmp:
+            for task in tasks:
+                start, solved = Path(tmp) / f"{task['id']}-start", Path(tmp) / f"{task['id']}-solution"
+                bench_repo(task, start)
+                bench_repo(task, solved, task["dir"] / "solution")
+                s0, s1 = hidden_score(task, start), hidden_score(task, solved)
+                visible = run_shell(task["visible_test"], solved, 300)[0] == 0
+                ok = s1["ok"] and visible and not s0["ok"]
+                bad += 0 if ok else 1
+                print(f"{'ok ' if ok else 'BAD'} {task['id']:<24} starter {s0['passed']}/{s0['total']}  "
+                      f"solution {s1['passed']}/{s1['total']}  visible {'pass' if visible else 'FAIL'}")
+                if not s1["ok"]:
+                    print(s1["tail"])
+        if bad:
+            raise HarnessError(f"{bad} task(s) invalid")
+        return
+
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    cfg = load_config()
+    for arm in arms:
+        if arm != "harness" and arm not in cfg["providers"]:
+            raise HarnessError(f"unknown approach {arm!r}: use 'harness' or a provider ({', '.join(cfg['providers'])})")
+    out = Path(args.out).expanduser() if args.out else BENCH_DIR / f"{dt.datetime.now():%Y%m%d-%H%M%S}"
+    work = out / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    results_path = out / "results.json"
+    results: List[Dict[str, Any]] = json.loads(results_path.read_text()) if results_path.exists() else []
+    done = {(r["task"], r["arm"], r["trial"]) for r in results}
+    plan = [(t, a, n) for n in range(1, args.trials + 1) for t in tasks for a in arms]
+    rng = random.Random(args.seed)
+    for n in range(1, args.trials + 1):  # shuffle approach order per task and trial so time-of-day effects spread out
+        for t in tasks:
+            chunk = [x for x in plan if x[0] is t and x[2] == n]
+            rng.shuffle(chunk)
+            plan = [x for x in plan if not (x[0] is t and x[2] == n)] + chunk
+    todo = [x for x in plan if (x[0]["id"], x[1], x[2]) not in done]
+    print(f"Benchmark {out}\n{len(tasks)} task(s) x {len(arms)} approach(es) x {args.trials} trial(s); {len(todo)} to run", flush=True)
+    for i, (task, arm, trial) in enumerate(todo, 1):
+        print(f"[{i}/{len(todo)}] {task['id']} / {arm} / trial {trial} ...", flush=True)
+        result = bench_trial(task, arm, trial, work, args)
+        results.append(result)
+        write_json(results_path, results)
+        h = result["hidden"]
+        print(f"    {result['status']}, hidden {h['passed']}/{h['total']}, {result['seconds'] / 60:.1f}m, "
+              f"{result['tokens']:,} tokens" + (f", ${result['cost_usd']:.2f}" if result.get("cost_usd") is not None else ""),
+              flush=True)
+    summary = bench_summary(results)
+    (out / "report.md").write_text(f"# Benchmark {out.name}\n\n{summary}\n")
+    print("\n" + summary + f"\n\nSaved {out / 'report.md'} and results.json")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-agent AI harness with model fallback")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1356,6 +1619,16 @@ def main() -> None:
     p.add_argument("--repo", default=".")
     p.add_argument("--delete", action="store_true", help="also delete the run directory")
     p.add_argument("run_id")
+    p = sub.add_parser("bench", help="compare the harness with single agents on tasks with hidden tests")
+    p.add_argument("bench_cmd", nargs="?", choices=("run", "validate", "report"), default="run")
+    p.add_argument("--tasks", help="task directory (default: bench/tasks next to the engine)")
+    p.add_argument("--task", action="append", help="run only this task id (repeatable)")
+    p.add_argument("--arms", default="harness,sol,claude", help="comma list: harness and/or provider ids")
+    p.add_argument("--trials", type=int, default=1)
+    p.add_argument("--rounds", type=int, help="harness max rounds (default: config)")
+    p.add_argument("--budget", type=float, default=20, help="USD cap for a solo Claude call (default 20)")
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out", help="results directory; reusing one resumes unfinished trials")
     sub.add_parser("init", help="write default config and install OpenCode agents")
     p = sub.add_parser("config", help="show config or toggle a provider")
     p.add_argument("provider", nargs="?")
@@ -1367,7 +1640,7 @@ def main() -> None:
             cmd_start(args, foreground=args.cmd == "run")
         else:
             {"resume": cmd_resume, "status": cmd_status, "stop": cmd_stop, "list": cmd_list, "apply": cmd_apply,
-             "cleanup": cmd_cleanup, "init": cmd_init, "config": cmd_config}[args.cmd](args)
+             "cleanup": cmd_cleanup, "init": cmd_init, "config": cmd_config, "bench": cmd_bench}[args.cmd](args)
     except HarnessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

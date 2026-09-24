@@ -9,6 +9,7 @@
 - `engine/harness.py`: CLI + orchestration (snapshot, plan, parallel workers in git worktrees, review, integration, fallback, config).
 - `app/HarnessMonitor.swift`: single-file SwiftUI app (`HarnessLoop.app`). Reads `<project>/.ai-harness/runs/*/state.json`, calls the engine through `/bin/zsh -lc`, edits `~/.ai-harness/config.json`. Bundles and bootstraps the engine from `Contents/Resources/harness.py`.
 - `app/AppIcon.png`: 1024px icon master; `build.sh` turns it into `AppIcon.icns`.
+- `bench/tasks/`: benchmark tasks for `harness bench` (starter repo, hidden tests, reference solution per task).
 - `scripts/build.sh`: build universal app, optional install and release zip.
 - `scripts/install.sh`: install latest GitHub Release.
 - `.github/workflows/ci.yml`, `release.yml`: CI build; tag `v*` publishes a Release.
@@ -19,6 +20,7 @@
 - Build only: `scripts/build.sh --no-install`
 - Release zip: `scripts/build.sh --no-install --zip`
 - Engine syntax check: `python3 -m py_compile engine/harness.py`
+- Benchmark task check: `python3 engine/harness.py bench validate`
 - No automated test suite exists. Verify engine changes with a throwaway Git repo under a temp directory, never with real projects.
 
 ## Development Rules
