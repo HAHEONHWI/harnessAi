@@ -4,7 +4,8 @@
 Flow per run: snapshot project -> coordinator plans -> workers run in parallel
 (isolated worktrees) -> optional security review -> coordinator review ->
 approved patches integrated into a private integration worktree -> repeat up
-to max_rounds -> final.patch the user applies with `apply`.
+to max_rounds -> final.patch the user applies with `apply` -> a summarizer
+writes report.md explaining the result.
 
 Every model call goes through a fallback chain; when a provider hits a usage,
 quota, or rate limit (or is disabled/missing), the next provider is tried.
@@ -49,6 +50,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds": 3,
     "max_workers": 4,
     "call_timeout_minutes": 45,
+    "summary_role": "luna",  # writes report.md after a run; "" disables it
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")
@@ -104,7 +106,7 @@ def load_config() -> Dict[str, Any]:
     for name, values in user.get("providers", {}).items():
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
-    for key in ("max_rounds", "max_workers", "call_timeout_minutes"):
+    for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role"):
         if key in user:
             cfg[key] = user[key]
     return cfg
@@ -230,7 +232,7 @@ class Run:
         write_json(run_dir / "state.json", {
             "id": run_id, "repo": str(repo), "command": command, "scope": scope, "status": "queued",
             "round": 0, "max_rounds": rounds, "pid": None, "started": now(), "updated": now(),
-            "ended": None, "base": None, "error": None, "summary": None, "feedback": None,
+            "ended": None, "base": None, "error": None, "summary": None, "report": None, "feedback": None,
             "rounds": [], "tasks": [], "events": [],
         })
         return cls(repo, run_id)
@@ -589,6 +591,63 @@ END_JSON
 """
 
 
+def summary_prompt(run: Run, final: str, files: List[str], review: Dict[str, Any]) -> str:
+    rounds = []
+    for r in run.data["rounds"]:
+        plan, rv = r.get("plan") or {}, r.get("review") or {}
+        rounds.append(f"Round {r['round']}: goal: {plan.get('goal') or plan.get('summary', '')}\n"
+                      f"  review: {rv.get('summary', '(none)')}" + (f"\n  feedback: {rv['feedback']}" if rv.get("feedback") else ""))
+    workers = "\n".join(f"- {t['name']} ({t.get('provider') or t['role']}): {t['state']}"
+                         + (f" - {clip(t['error'], 300)}" if t.get("error") else "")
+                         for t in run.data["tasks"] if t.get("kind") == "work")
+    unresolved = "" if review.get("done") else f"\nUnresolved (review said not done): {review.get('feedback') or '(no details)'}\n"
+    return f"""You summarize the result of a multi-agent coding harness run for the user who requested it.
+The working tree holds the final result; you may inspect it read-only.
+
+User command:
+{run.data['command']}
+
+Rounds:
+{chr(10).join(rounds) or '(none)'}
+
+Workers:
+{workers or '(none)'}
+{unresolved}
+Changed files ({len(files)}): {', '.join(files) or 'none'}
+
+Final patch (not yet applied to the user's project):
+```diff
+{clip(final, 60000) or '(no changes)'}
+```
+
+{COMMON_RULES}
+
+Write a concise Markdown report in the same language as the user command, with these sections:
+1. Result: one or two sentences on what was achieved and whether the command is fully done.
+2. Changes: per file or feature, what changed and why.
+3. How to verify: concrete steps or commands the user can run after applying.
+4. Caveats: unresolved work, risks, assumptions, or rejected/failed workers. Write "None" if there are none.
+Base every claim on the patch and the notes above; do not invent changes. Reply with the report only."""
+
+
+def write_report(run: Run, integration: Path, final: str, files: List[str], review: Dict[str, Any]) -> None:
+    role = str(load_config().get("summary_role") or "")
+    if role not in PROVIDER_CLI:
+        return
+    run.update(status="summarizing")
+    task = run.add_task(name="summary", kind="summary", round=run.data["round"], role=role)
+    try:
+        report = call_agent(run, task, role, "read", integration, summary_prompt(run, final, files, review))
+        (run.dir / "report.md").write_text(report.strip() + "\n")
+        run.set_task(task, state="done", ended=now())
+        run.update(report="report.md")
+    except Stopped:
+        raise
+    except HarnessError as exc:  # the patch is ready either way; a missing report must not fail the run
+        run.set_task(task, state="failed", error=str(exc), ended=now())
+        run.event(f"summary unavailable: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 
@@ -829,6 +888,7 @@ def execute(run: Run) -> None:
         final = git(integration, "diff", "--binary", base, head, strip=False) if head != base else ""
         (run.dir / "final.patch").write_text(final)
         files = git(integration, "diff", "--name-only", base, head).splitlines() if final else []
+        write_report(run, integration, final, files, review)
         run.update(status="ready" if final else "no-changes", ended=now(), final_files=files,
                    summary=review.get("summary"), feedback=None if review.get("done") else review.get("feedback"),
                    completed=bool(review.get("done")))
@@ -906,7 +966,7 @@ def pid_alive(pid: Optional[int]) -> bool:
         return True
 
 
-ACTIVE = {"queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating"}
+ACTIVE = {"queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "summarizing"}
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -926,6 +986,9 @@ def cmd_status(args: argparse.Namespace) -> None:
               f"{(str(secs) + 's') if secs is not None else '-':<7} {t.get('changed_files') if t.get('changed_files') is not None else '-'}")
     for e in state["events"][-5:]:
         print(f"  {dt.datetime.fromtimestamp(e['t']):%H:%M:%S} {e['msg']}")
+    report = runs_dir(repo_root(args.repo)) / state["id"] / (state.get("report") or "")
+    if state.get("report") and report.is_file():
+        print("\n" + report.read_text(errors="replace").rstrip())
 
 
 def cmd_list(args: argparse.Namespace) -> None:

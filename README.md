@@ -10,7 +10,7 @@
 ## 동작 방식
 
 ```
-명령 → 스냅샷 → Claude 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Claude 리뷰 → 통합 → 반복 → final.patch → Apply
+명령 → 스냅샷 → Claude 계획 → 워커 병렬 실행 (격리된 worktree) → (보안 리뷰) → Claude 리뷰 → 통합 → 반복 → final.patch → 결과 요약 → Apply
 ```
 
 1. 현재 작업 트리(커밋 안 된 파일 포함)를 스냅샷으로 뜹니다. HEAD, index, stash는 건드리지 않습니다.
@@ -19,6 +19,7 @@
 4. 보안 관련 변경이면 Claude가 patch를 리뷰합니다.
 5. 조율자가 승인한 patch만 전용 통합 worktree에 반영하고, 필요하면 다음 라운드를 진행합니다(기본 최대 3라운드).
 6. 결과는 `final.patch`로 남습니다. **Apply를 눌러야만 프로젝트 파일이 바뀝니다.**
+7. 요약 모델(`summary_role`, 기본 `luna`)이 최종 patch를 읽고 `report.md`를 씁니다: 결과, 변경 내용, 확인 방법, 남은 문제. 앱의 Summary 탭과 `status` 명령에서 볼 수 있습니다. 요약이 실패해도 patch는 그대로 적용할 수 있습니다.
 
 ## 역할과 fallback
 
@@ -33,7 +34,7 @@
 - 다음 모델로 넘어가는 조건: 사용량·쿼터·rate limit 오류, 모델 off, CLI 미설치.
 - 한도에 걸린 모델은 그 run이 끝날 때까지 다시 시도하지 않습니다.
 - Antigravity는 헤드리스 모드에서 셸 명령을 자동 거부합니다. `providers.antigravity.skip_permissions: true`로 모든 도구를 자동 승인할 수 있습니다(`--dangerously-skip-permissions`). 이때 `--sandbox`는 쓰지 않습니다(sandbox 안에서는 명령이 멈춤). 에이전트가 확인·격리 없이 셸 명령을 실행하므로 신뢰하는 프로젝트에서만 켜세요.
-- 설정 파일은 `~/.ai-harness/config.json`입니다. 모델, on/off, fallback 순서, `max_rounds`, `max_workers`, `call_timeout_minutes`를 여기서 바꿉니다.
+- 설정 파일은 `~/.ai-harness/config.json`입니다. 모델, on/off, fallback 순서, `max_rounds`, `max_workers`, `call_timeout_minutes`, `summary_role`(빈 문자열이면 요약 끔)을 여기서 바꿉니다.
 
 ## 설치
 

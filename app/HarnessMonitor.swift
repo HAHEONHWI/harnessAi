@@ -47,12 +47,13 @@ struct RunState: Decodable, Identifiable, Equatable {
     let ended: Double?
     let error: String?
     let summary: String?
+    let report: String?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
     let events: [EventItem]
 
-    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating"]
+    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "summarizing"]
 
     var engineAlive: Bool {
         guard let pid else { return false }
@@ -371,9 +372,9 @@ struct ContentView: View {
                     .id(name)
                 } else {
                     FileTabsView(runDir: store.runsDir.appendingPathComponent(run.id), tabs: [
-                        ("Events", nil), ("Final patch", "final.patch"), ("Engine log", "engine.log"),
-                    ], events: run.events)
-                    .id(run.id)
+                        ("Summary", run.report), ("Events", nil), ("Final patch", "final.patch"), ("Engine log", "engine.log"),
+                    ], events: run.events, initialTab: run.report == nil ? 1 : 0)
+                    .id("\(run.id)-\(run.report != nil)")
                 }
             } else {
                 ContentUnavailableView("Select a run", systemImage: "cpu")
@@ -623,8 +624,15 @@ struct FileTabsView: View {
     let runDir: URL
     let tabs: [(String, String?)]
     var events: [EventItem] = []
-    @State private var tab = 0
+    @State private var tab: Int
     @State private var follow = true
+
+    init(runDir: URL, tabs: [(String, String?)], events: [EventItem] = [], initialTab: Int = 0) {
+        self.runDir = runDir
+        self.tabs = tabs
+        self.events = events
+        _tab = State(initialValue: initialTab)
+    }
 
     func content() -> String? {
         let (title, path) = tabs[tab]
@@ -668,8 +676,8 @@ struct FileTabsView: View {
                             Color.clear.frame(height: 1).id("bottom")
                         }
                     }
-                    .onChange(of: text) { if follow { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
-                    .onAppear { if follow { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                    .onChange(of: text) { if follow && tabs[tab].0 != "Summary" { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                    .onAppear { if follow && tabs[tab].0 != "Summary" { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
                 }
             }
         }
