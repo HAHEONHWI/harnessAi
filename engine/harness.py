@@ -65,6 +65,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "fast_path": True,
     # Review judges only the command and acceptance criteria (no extra hardening rounds).
     "focused_review": True,
+    "prefer_single_worker": True,  # plan with one worker unless parts are large and independent
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
@@ -128,7 +129,7 @@ def load_config() -> Dict[str, Any]:
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
     for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role", "coordinator", "fast_path",
-                "focused_review"):
+                "focused_review", "prefer_single_worker"):
         if key in user:
             cfg[key] = user[key]
     return cfg
@@ -688,6 +689,9 @@ def plan_prompt(run: Run, round_no: int, feedback: Optional[str], error: Optiona
     verify = verify_command(run.repo)
     verify_text = (f"\nAfter each round the harness runs `{verify}` on the integrated tree; the work is only done when it passes. "
                    "Workers do not run it themselves.\n") if verify else ""
+    single = ("\nPrefer a single assignment. Split only when the work has independent parts that each need several minutes "
+              "of work; every extra worker adds coordination, review and merge cost that outweighs parallelism on small or "
+              "tightly coupled changes." if cfg.get("prefer_single_worker", True) else "")
     return f"""You are the coordinator of a multi-agent coding harness. Round {round_no} of {run.data['max_rounds']}.
 Earlier rounds' approved changes are already present in this working tree.
 {verify_text}
@@ -697,8 +701,7 @@ User command:
 Worker roles:
 {role_guide(cfg)}
 
-Inspect the repository read-only, then split the remaining work into 1-{cfg['max_workers']} independent assignments that can run in parallel for speed.
-Prefer a single assignment. Split only when the work has independent parts that each need several minutes of work; every extra worker adds coordination, review and merge cost that outweighs parallelism on small or tightly coupled changes.
+Inspect the repository read-only, then split the remaining work into 1-{cfg['max_workers']} independent assignments that can run in parallel for speed.{single}
 Each assignment owns disjoint paths (files or directories relative to the repo root); workers may only modify their owned paths.
 Never assign .git, .env*, secrets, generated output, the .ai-harness directory, or protected paths{protected_text}.
 Set "security_review": true when the change touches auth, privacy, access rules, secrets, payments, or deployment.

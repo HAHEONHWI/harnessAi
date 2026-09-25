@@ -37,7 +37,7 @@
 - 한도에 걸린 모델은 그 run이 끝날 때까지 다시 시도하지 않습니다.
 - Antigravity는 헤드리스 모드에서 셸 명령을 자동 거부합니다. `providers.antigravity.skip_permissions: true`로 모든 도구를 자동 승인할 수 있습니다(`--dangerously-skip-permissions`). 이때 `--sandbox`는 쓰지 않습니다(sandbox 안에서는 명령이 멈춤). 에이전트가 확인·격리 없이 셸 명령을 실행하므로 신뢰하는 프로젝트에서만 켜세요.
 - 설정 파일은 `~/.ai-harness/config.json`입니다. 모델, on/off, fallback 순서, `max_rounds`, `max_workers`, `call_timeout_minutes`, `summary_role`(빈 문자열이면 요약 끔)을 여기서 바꿉니다.
-- 효율 설정(기본 켜짐): `fast_path`는 워커가 1명이고 프로젝트에 `verify_command`가 있으면 조율자 리뷰 없이 통합한 뒤 검증 결과로 완료를 판단합니다. `focused_review`는 리뷰가 명령과 수용 기준만 보고 명세 밖 보강을 요구하지 않게 합니다. `coordinator`로 계획·리뷰 모델을 바꿀 수 있습니다(기본 `claude`).
+- 효율 설정(기본 켜짐): `fast_path`는 워커가 1명이고 프로젝트에 `verify_command`가 있으면 조율자 리뷰 없이 통합한 뒤 검증 결과로 완료를 판단합니다. `focused_review`는 리뷰가 명령과 수용 기준만 보고 명세 밖 보강을 요구하지 않게 합니다. `prefer_single_worker`는 작은 작업을 워커 한 명에게 맡기게 합니다. `coordinator`로 계획·리뷰 모델을 바꿀 수 있습니다(기본 `claude`).
 
 ## 토큰 사용량
 
