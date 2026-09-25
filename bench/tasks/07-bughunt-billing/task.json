@@ -1,0 +1,11 @@
+{
+  "title": "Bug hunt in a billing package (hard, symptoms only, several modules)",
+  "size": "hard",
+  "scope": [
+    "billing",
+    "tests"
+  ],
+  "visible_test": "python3 -m unittest discover -s tests -t tests -q",
+  "hidden_count": 18,
+  "command": "Support reported these problems with the subscription billing package in `billing`. Find and fix the root causes. Keep public names and signatures; behavior not mentioned here must keep working.\n\n1. An admin priced a plan at \"0.1\" and customers were charged one cent. Amounts may have one or two decimals.\n2. A 5-cent refund shows on statements as \"-1.95\". Negative amounts must read like \"-0.05\" and \"-1,234.50\".\n3. Customers who signed up on the 29th, 30th or 31st get an error in shorter months. In such a month their period starts on the month's last day.\n4. Proration charged nothing for a customer who used a plan for a single day. Used days count both the first and the last day, relative to the period's length counted the same way.\n5. Splitting an invoice across departments sometimes loses or invents a cent. The parts must always add up to the total; leftover cents go to the parts with the largest remainders, earlier parts first on ties.\n6. Invoices with many small lines are sometimes a cent off. Tax is charged once, on the discounted subtotal.\n7. The first invoice of 2027 was numbered INV-2027-0042. Numbering restarts at 0001 every year, and each year keeps its own sequence even when calls for different years interleave.\n8. Customers who paid on the last day of the grace period were marked late. An invoice is late only when it was fully paid after due date + grace days, or is still unpaid after that day.\n\nNot a bug: a customer asked why paying one cent less than the invoice leaves it open. That is correct; keep it."
+}
