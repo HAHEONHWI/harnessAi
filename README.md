@@ -65,7 +65,7 @@ python3 engine/harness.py bench --arms harness,sol,claude --trials 3
 
 ```bash
 python3 engine/harness.py bench --arms harness,harness-classic,claude \
-  --arm-config 'harness-classic={"fast_path": false, "focused_review": false}' \
+  --arm-config 'harness-classic={"fast_path": false, "focused_review": false, "prefer_single_worker": false}' \
   --config '{"providers": {"sol": {"enabled": false}}}'
 ```
 
