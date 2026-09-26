@@ -23,6 +23,7 @@ After an approach finishes, the hidden tests are copied in and run. Results go t
 | 04-rework-pricing | medium | exact money rules with Decimal (bulk tiers, coupons, tax, shipping) |
 | 05-spreadsheet-engine | hard | formula parser, precedence, lazy IF, error propagation, cycles, 3000-cell chains |
 | 06-mini-sql | hard | SQL lexer/parser/executor: joins, GROUP BY/HAVING, NULL logic, ORDER BY rules |
+| 07-bughunt-billing | hard | eight support tickets (symptoms only) across money, periods, invoices, ledger; fix without regressions |
 
 ## Adding a task
 
