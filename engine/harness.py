@@ -66,6 +66,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Review judges only the command and acceptance criteria (no extra hardening rounds).
     "focused_review": True,
     "prefer_single_worker": True,  # plan with one worker unless parts are large and independent
+    # auto: one agent does the task alone (no coordinator); escalate to the full harness only if verification
+    # still fails after solo_attempts. solo: never escalate. harness: always plan/work/review.
+    "routing": "auto",
+    "solo_role": "claude",
+    "solo_attempts": 2,
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
@@ -129,7 +134,7 @@ def load_config() -> Dict[str, Any]:
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
     for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role", "coordinator", "fast_path",
-                "focused_review", "prefer_single_worker"):
+                "focused_review", "prefer_single_worker", "routing", "solo_role", "solo_attempts"):
         if key in user:
             cfg[key] = user[key]
     return cfg
@@ -286,14 +291,14 @@ class Run:
         self.stopping = False
 
     @classmethod
-    def create(cls, repo: Path, command: str, slug: str, rounds: int, scope: List[str]) -> "Run":
+    def create(cls, repo: Path, command: str, slug: str, rounds: int, scope: List[str], mode: Optional[str] = None) -> "Run":
         run_id = f"{dt.datetime.now():%Y%m%d-%H%M%S}-{slug}"
         run_dir = runs_dir(repo) / run_id
         for sub in ("logs", "prompts", "results", "worktrees"):
             (run_dir / sub).mkdir(parents=True, exist_ok=False)
         write_json(run_dir / "state.json", {
-            "id": run_id, "repo": str(repo), "command": command, "scope": scope, "status": "queued",
-            "round": 0, "max_rounds": rounds, "pid": None, "started": now(), "updated": now(),
+            "id": run_id, "repo": str(repo), "command": command, "scope": scope, "mode": mode, "route": None, "status": "queued",
+            "round": 0, "max_rounds": rounds, "requested_rounds": rounds, "pid": None, "started": now(), "updated": now(),
             "ended": None, "base": None, "error": None, "summary": None, "report": None, "verify": None, "feedback": None,
             "rounds": [], "tasks": [], "events": [],
         })
@@ -1105,6 +1110,86 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
     return review
 
 
+def solo_task_prompt(run: Run, feedback: Optional[str]) -> str:
+    scope = run.data.get("scope") or []
+    scope_text = f"\nOnly change these files/folders: {', '.join(scope)}\n" if scope else ""
+    history = f"\nYour previous attempt is already in the working tree but was not accepted:\n{feedback}\n" if feedback else ""
+    verify = verify_command(run.repo)
+    verify_text = (f"\nBefore finishing, run `{verify}` and make it pass. Do not delete or weaken existing tests.\n"
+                   if verify else "")
+    rules = COMMON_RULES.replace("\n- Do not add or run tests unless the assignment says so.", "") if verify else COMMON_RULES
+    return f"""You are completing a coding task on your own in this repository.
+
+Task:
+{run.data['command']}
+{scope_text}{history}{verify_text}
+{rules}
+
+When finished, report changed files, assumptions, and the checks you actually ran."""
+
+
+def run_solo_attempt(run: Run, integration: Path, round_no: int, feedback: Optional[str]) -> Dict[str, Any]:
+    """One agent does the whole task in its own worktree; allowed changes are integrated without a coordinator."""
+    cfg = load_config()
+    role = str(cfg.get("solo_role") or "claude")
+    run.update(round=round_no, status="working")
+    record: Dict[str, Any] = {"round": round_no, "plan": {"solo": True, "role": role}, "review": None}
+    with run.lock:
+        run.data["rounds"].append(record)
+        run.save()
+    base = git(integration, "rev-parse", "HEAD")
+    task = run.add_task(name=f"r{round_no}-solo", kind="work", round=round_no, role=role,
+                        owned_paths=run.data.get("scope") or None)
+    worktree = run.dir / "worktrees" / task["name"]
+    review: Dict[str, Any] = {"solo": True, "approve": [], "done": None}
+    record["review"] = review
+    try:
+        git(run.repo, "worktree", "add", "--detach", str(worktree), base)
+        result = call_agent(run, task, role, "solo", worktree, solo_task_prompt(run, feedback))
+        review["summary"] = clip(result.strip(), 600)
+        git(worktree, "add", "-N", "--all")
+        changed = [f for f in git(worktree, "diff", "--name-only", base).splitlines() if f and not f.startswith(TOOL_NOISE)]
+        protected = protected_paths(worktree)
+        scope = run.data.get("scope") or []
+        allowed = [f for f in changed if (not scope or in_scope(f, scope)) and not is_protected(f, protected)]
+        dropped = [f for f in changed if f not in allowed]
+        if dropped:
+            (run.dir / f"results/{task['name']}.out-of-scope.txt").write_text("\n".join(dropped) + "\n")
+            run.event(f"{task['name']}: left out {len(dropped)} file(s) outside the scope or protected: {', '.join(dropped[:5])}")
+        patch_rel = f"results/{task['name']}.patch"
+        patch = git(worktree, "diff", "--binary", base, "--", *allowed, strip=False) if allowed else ""
+        (run.dir / patch_rel).write_text(patch)
+        run.set_task(task, state="done", patch=patch_rel, changed_files=len(allowed), ended=now())
+        if not patch:
+            review["feedback"] = "The previous attempt made no allowed changes."
+            run.event(f"{task['name']}: no changes")
+            return review
+        run.update(status="integrating")
+        check = subprocess.run(["git", "-C", str(integration), "apply", "--index", str(run.dir / patch_rel)],
+                               capture_output=True, text=True)
+        if check.returncode != 0:
+            run.set_task(task, state="conflict", error=check.stderr.strip())
+            git(integration, "reset", "--hard", "-q", check=False)
+            review["feedback"] = f"The patch did not apply: {check.stderr.strip()}"
+            return review
+        git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {task['name']}")
+        run.set_task(task, state="integrated")
+        review["approve"] = [task["name"]]
+        review["applied"] = True
+        run.event(f"{task['name']}: integrated {len(allowed)} file(s) on {task['provider']}")
+    except Stopped:
+        run.set_task(task, state="stopped", ended=now())
+        raise
+    except HarnessError as exc:
+        run.set_task(task, state="failed", error=str(exc), ended=now())
+        review["feedback"] = f"The solo attempt failed: {exc}"
+        run.event(f"{task['name']}: failed: {exc}")
+    finally:
+        if worktree.exists():
+            git(run.repo, "worktree", "remove", "--force", str(worktree), check=False)
+    return review
+
+
 def fast_integrate(run: Run, integration: Path, round_no: int, record: Dict[str, Any], task: Dict[str, Any],
                    plan: Dict[str, Any]) -> Dict[str, Any]:
     """Single-worker round with a verify command: skip the coordinator review; execute() decides from verification."""
@@ -1153,18 +1238,36 @@ def execute(run: Run) -> None:
         review: Dict[str, Any] = {}
         verified_head = None
         verify: Optional[Dict[str, Any]] = None
-        for round_no in range(1, int(run.data["max_rounds"]) + 1):
-            review = run_round(run, integration, round_no, feedback)
+        cfg = load_config()
+        mode = run.data.get("mode") or str(cfg.get("routing") or "auto")
+        harness_rounds = int(run.data["max_rounds"])
+        solo_rounds = {"harness": 0, "solo": harness_rounds}.get(mode, max(1, int(cfg.get("solo_attempts", 2))))
+        total = solo_rounds + (harness_rounds if mode == "auto" else 0) if mode != "harness" else harness_rounds
+        run.update(mode=mode, route="harness" if mode == "harness" else "solo", max_rounds=total)
+        run.event(f"routing: {mode}" + (f" (solo up to {solo_rounds} attempt(s), then harness)" if mode == "auto" else ""))
+        for round_no in range(1, total + 1):
+            if round_no <= solo_rounds:
+                review = run_solo_attempt(run, integration, round_no, feedback)
+            else:
+                if run.data.get("route") == "solo":
+                    run.update(route="solo+harness")
+                    run.event(f"escalating to the harness after {solo_rounds} solo attempt(s)")
+                review = run_round(run, integration, round_no, feedback)
             head = git(integration, "rev-parse", "HEAD")
             if head != verified_head:  # nothing new to check when the round integrated nothing
                 verify = run_verify(run, integration, round_no) or verify
                 verified_head = head
             if review.get("fast_path") and review.get("done") is None:
                 review["done"] = bool(verify and verify["passed"] and verify["round"] == round_no)
+            if review.get("solo") and review.get("done") is None:
+                if verify_command(run.repo):
+                    review["done"] = bool(verify and verify["passed"] and verify["round"] == round_no)
+                else:  # nothing objective to check: accept the solo result as is
+                    review["done"] = bool(review.get("applied"))
             if verify and not verify["passed"]:
                 review = {**review, "done": False, "feedback": (review.get("feedback") or "") +
                           f"\nVerification `{verify['command']}` failed (exit {verify['exit']}). Fix it. Output tail:\n{verify['tail']}"}
-                if round_no < int(run.data["max_rounds"]):
+                if round_no < total:
                     run.event(f"round {round_no}: verification failed; continuing")
             if review.get("done"):
                 break
@@ -1216,7 +1319,7 @@ def cmd_start(args: argparse.Namespace, foreground: bool) -> None:
         raise HarnessError("command is empty")
     rounds = args.rounds or int(load_config()["max_rounds"])
     scope = normalize_scope(repo, args.path or [])
-    run = Run.create(repo, command, args.slug or slugify(command), rounds, scope)
+    run = Run.create(repo, command, args.slug or slugify(command), rounds, scope, getattr(args, "mode", None))
     if foreground:
         execute(run)
         return
@@ -1511,6 +1614,8 @@ def bench_homes(out: Path, arms: List[str], args: argparse.Namespace) -> Dict[st
         if not name.startswith("harness"):
             raise HarnessError(f"--arm-config is for harness variants (name must start with 'harness'): {name}")
         variants[name] = json.loads(raw)
+    args.routing = {arm: merge_config(json.loads(args.config) if args.config else {}, variants.get(arm, {})).get("routing")
+                    for arm in arms}
     homes = {}
     for arm in ["_base"] + [a for a in arms if a.startswith("harness")]:
         home = out / "homes" / arm
@@ -1535,6 +1640,8 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
     if arm.startswith("harness"):
         env = {**os.environ, "AI_HARNESS_HOME": str(homes[arm])} if homes else None
         cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--repo", str(repo), "--slug", "bench"]
+        # Harness arms run the full harness unless their overlay sets "routing" (e.g. harness-auto={"routing": "auto"}).
+        cmd += ["--mode", (getattr(args, "routing", {}) or {}).get(arm) or "harness"]
         if args.rounds:
             cmd += ["--rounds", str(args.rounds)]
         for path in scope:
@@ -1701,6 +1808,8 @@ def main() -> None:
         p.add_argument("--slug")
         p.add_argument("--path", action="append", metavar="PATH",
                        help="limit changes to this file or folder (repeatable or comma-separated)")
+        p.add_argument("--mode", choices=("auto", "solo", "harness"),
+                       help="auto: one agent first, harness only if verification keeps failing (default: config routing)")
         p.add_argument("command_text", metavar="COMMAND")
     p = sub.add_parser("resume", help=argparse.SUPPRESS)
     p.add_argument("--repo", default=".")
