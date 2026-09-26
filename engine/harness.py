@@ -60,11 +60,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_workers": 4,
     "call_timeout_minutes": 45,
     "summary_role": "luna",  # writes report.md after a run; "" disables it
+    "coordinator": "claude",  # plans and reviews every round
+    # One-worker round + project verify_command: integrate and let the tests decide instead of a coordinator review.
+    "fast_path": True,
+    # Review judges only the command and acceptance criteria (no extra hardening rounds).
+    "focused_review": True,
+    "prefer_single_worker": True,  # plan with one worker unless parts are large and independent
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
 PLACEHOLDER_RE = re.compile(r"\{(prompt|model|workdir|message_file)\}")
-COORDINATOR = "claude"  # plans and reviews every round
+
+
+def coordinator() -> str:
+    """Provider that plans and reviews every round (config "coordinator", default claude)."""
+    cfg = load_config()
+    role = str(cfg.get("coordinator") or "claude")
+    return role if role in cfg["providers"] else "claude"
 
 # GUI apps start with a minimal PATH; make the agent CLIs reachable.
 os.environ["PATH"] = os.pathsep.join(
@@ -116,7 +128,8 @@ def load_config() -> Dict[str, Any]:
     for name, values in user.get("providers", {}).items():
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
-    for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role"):
+    for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role", "coordinator", "fast_path",
+                "focused_review", "prefer_single_worker"):
         if key in user:
             cfg[key] = user[key]
     return cfg
@@ -676,6 +689,9 @@ def plan_prompt(run: Run, round_no: int, feedback: Optional[str], error: Optiona
     verify = verify_command(run.repo)
     verify_text = (f"\nAfter each round the harness runs `{verify}` on the integrated tree; the work is only done when it passes. "
                    "Workers do not run it themselves.\n") if verify else ""
+    single = ("\nPrefer a single assignment. Split only when the work has independent parts that each need several minutes "
+              "of work; every extra worker adds coordination, review and merge cost that outweighs parallelism on small or "
+              "tightly coupled changes." if cfg.get("prefer_single_worker", True) else "")
     return f"""You are the coordinator of a multi-agent coding harness. Round {round_no} of {run.data['max_rounds']}.
 Earlier rounds' approved changes are already present in this working tree.
 {verify_text}
@@ -685,7 +701,7 @@ User command:
 Worker roles:
 {role_guide(cfg)}
 
-Inspect the repository read-only, then split the remaining work into 1-{cfg['max_workers']} independent assignments that can run in parallel for speed.
+Inspect the repository read-only, then split the remaining work into 1-{cfg['max_workers']} independent assignments that can run in parallel for speed.{single}
 Each assignment owns disjoint paths (files or directories relative to the repo root); workers may only modify their owned paths.
 Never assign .git, .env*, secrets, generated output, the .ai-harness directory, or protected paths{protected_text}.
 Set "security_review": true when the change touches auth, privacy, access rules, secrets, payments, or deployment.
@@ -747,6 +763,9 @@ Return only actionable findings ordered by severity with file:line references. S
 def review_prompt(run: Run, plan: Dict[str, Any], workers: List[Dict[str, Any]], security: Optional[str]) -> str:
     acceptance = "\n".join(f"- {a}" for a in plan.get("acceptance", []))
     sec = f"\nSecurity review findings:\n{clip(security, 8000)}\n" if security else ""
+    focus = ("\nJudge only against the user command and the acceptance criteria. Do not ask for hardening, refactors, "
+             "extra tests, style changes or edge cases the command does not require; another round costs minutes and "
+             "tokens, so request one only for unmet requirements or real bugs." if load_config().get("focused_review", True) else "")
     return f"""You are the coordinator of a multi-agent coding harness reviewing round {run.data['round']} of {run.data['max_rounds']}.
 User command: {run.data['command']}
 Goal: {plan.get('goal', '')}
@@ -757,7 +776,7 @@ Acceptance criteria:
 {sec}
 Approve only patches that are correct, safe, and within their owned paths. The working tree holds previous rounds' changes; you may inspect it read-only.
 Set "done": true only if the acceptance criteria are met once approved patches are integrated.
-Otherwise put precise remaining work in "feedback" for the next round.
+Otherwise put precise remaining work in "feedback" for the next round.{focus}
 
 Reply between BEGIN_JSON and END_JSON:
 BEGIN_JSON
@@ -980,9 +999,10 @@ def check_outside_changes(run: Run, round_no: int) -> None:
 def coordinator_call(run: Run, name: str, kind: str, workdir: Path, build_prompt, validate=None) -> Dict[str, Any]:
     error = None
     for attempt in (1, 2):
-        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role=COORDINATOR)
+        role = coordinator()
+        task = run.add_task(name=name if attempt == 1 else f"{name}-retry", kind=kind, round=run.data["round"], role=role)
         try:
-            data = extract_json(call_agent(run, task, COORDINATOR, "read", workdir, build_prompt(error)))
+            data = extract_json(call_agent(run, task, role, "read", workdir, build_prompt(error)))
             if validate:
                 validate(data)
             run.set_task(task, state="done", ended=now())
@@ -1031,6 +1051,9 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
     check_outside_changes(run, round_no)
 
     reviewable = [t for t in tasks if t["state"] == "done" and t.get("changed_files")]
+    if (cfg.get("fast_path", True) and len(tasks) == 1 and verify_command(run.repo)
+            and not plan.get("security_review")):
+        return fast_integrate(run, integration, round_no, record, tasks[0], plan)
     security = None
     if reviewable and plan.get("security_review"):
         run.update(status="security-review")
@@ -1082,6 +1105,32 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
     return review
 
 
+def fast_integrate(run: Run, integration: Path, round_no: int, record: Dict[str, Any], task: Dict[str, Any],
+                   plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Single-worker round with a verify command: skip the coordinator review; execute() decides from verification."""
+    review: Dict[str, Any] = {"fast_path": True, "approve": [], "done": False, "summary": plan.get("goal", "")}
+    record["review"] = review
+    run.update(status="integrating")
+    if task["state"] != "done" or not task.get("changed_files"):
+        reason = task.get("error") or ("no changes" if task["state"] == "done" else task["state"])
+        review["feedback"] = f"{task['name']} produced nothing to integrate ({reason}). Redo the work within owned paths."
+        run.event(f"round {round_no}: fast path, nothing to integrate ({reason})")
+        return review
+    check = subprocess.run(["git", "-C", str(integration), "apply", "--3way", "--index", str(run.dir / task["patch"])],
+                           capture_output=True, text=True)
+    if check.returncode != 0:
+        run.set_task(task, state="conflict", error=check.stderr.strip())
+        git(integration, "reset", "--hard", "-q", check=False)
+        review["feedback"] = f"{task['name']} did not apply: {check.stderr.strip()}"
+        return review
+    git(integration, *GIT_IDENT, "commit", "-q", "--no-verify", "-m", f"ai-harness round {round_no}: {task['name']}")
+    run.set_task(task, state="integrated")
+    review["approve"] = [task["name"]]
+    review["done"] = None  # decided by verification
+    run.event(f"round {round_no}: fast path integrated {task['name']}; verification decides")
+    return review
+
+
 def execute(run: Run) -> None:
     def on_signal(signum, _frame):
         run.stopping = True
@@ -1110,6 +1159,8 @@ def execute(run: Run) -> None:
             if head != verified_head:  # nothing new to check when the round integrated nothing
                 verify = run_verify(run, integration, round_no) or verify
                 verified_head = head
+            if review.get("fast_path") and review.get("done") is None:
+                review["done"] = bool(verify and verify["passed"] and verify["round"] == round_no)
             if verify and not verify["passed"]:
                 review = {**review, "done": False, "feedback": (review.get("feedback") or "") +
                           f"\nVerification `{verify['command']}` failed (exit {verify['exit']}). Fix it. Output tail:\n{verify['tail']}"}
@@ -1439,7 +1490,41 @@ Before finishing, run `{task['visible_test']}` and make it pass. Do not delete o
 When finished, report changed files and the checks you ran."""
 
 
-def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: argparse.Namespace) -> Dict[str, Any]:
+def merge_config(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(base))
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge_config(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def bench_homes(out: Path, arms: List[str], args: argparse.Namespace) -> Dict[str, Path]:
+    """Per-approach AI_HARNESS_HOME with the user's config plus --config and --arm-config overlays."""
+    global HOME_DIR, CONFIG_PATH
+    user = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else json.loads(json.dumps(DEFAULT_CONFIG))
+    base = merge_config(user, json.loads(args.config) if args.config else {})
+    variants: Dict[str, Dict[str, Any]] = {}
+    for spec in args.arm_config or []:
+        name, _, raw = spec.partition("=")
+        if not name.startswith("harness"):
+            raise HarnessError(f"--arm-config is for harness variants (name must start with 'harness'): {name}")
+        variants[name] = json.loads(raw)
+    homes = {}
+    for arm in ["_base"] + [a for a in arms if a.startswith("harness")]:
+        home = out / "homes" / arm
+        home.mkdir(parents=True, exist_ok=True)
+        write_json(home / "config.json", merge_config(base, variants.get(arm, {})))
+        homes[arm] = home
+    # Solo approaches run in this process: point it at the shared config.
+    HOME_DIR, CONFIG_PATH = homes["_base"], homes["_base"] / "config.json"
+    os.environ["AI_HARNESS_HOME"] = str(homes["_base"])
+    return homes
+
+
+def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: argparse.Namespace,
+                homes: Optional[Dict[str, Path]] = None) -> Dict[str, Any]:
     repo = work / f"{task['id']}-{arm}-{trial}"
     shutil.rmtree(repo, ignore_errors=True)
     bench_repo(task, repo)
@@ -1447,7 +1532,8 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
     result: Dict[str, Any] = {"task": task["id"], "arm": arm, "trial": trial, "repo": str(repo),
                               "status": "failed", "error": None, "usage": [], "rounds": None}
     started = now()
-    if arm == "harness":
+    if arm.startswith("harness"):
+        env = {**os.environ, "AI_HARNESS_HOME": str(homes[arm])} if homes else None
         cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--repo", str(repo), "--slug", "bench"]
         if args.rounds:
             cmd += ["--rounds", str(args.rounds)]
@@ -1455,7 +1541,7 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
             cmd += ["--path", path]
         cmd += ["--", task["command"]]
         with (work / f"{repo.name}.engine.log").open("w") as log:
-            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
         runs = sorted(runs_dir(repo).iterdir()) if runs_dir(repo).exists() else []
         state = json.loads((runs[-1] / "state.json").read_text()) if runs else {}
         result.update(status=state.get("status", "failed"), error=state.get("error"), usage=state.get("usage") or [],
@@ -1464,7 +1550,7 @@ def bench_trial(task: Dict[str, Any], arm: str, trial: int, work: Path, args: ar
                                     if a.get("status") == "limit"})
         if state.get("status") == "ready":
             applied = subprocess.run([sys.executable, str(Path(__file__).resolve()), "apply", "--repo", str(repo), state["id"]],
-                                     capture_output=True, text=True)
+                                     capture_output=True, text=True, env=env)
             if applied.returncode != 0:
                 result.update(status="apply-failed", error=applied.stderr.strip())
     else:
@@ -1562,13 +1648,14 @@ def cmd_bench(args: argparse.Namespace) -> None:
         return
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    cfg = load_config()
-    for arm in arms:
-        if arm != "harness" and arm not in cfg["providers"]:
-            raise HarnessError(f"unknown approach {arm!r}: use 'harness' or a provider ({', '.join(cfg['providers'])})")
     out = Path(args.out).expanduser() if args.out else BENCH_DIR / f"{dt.datetime.now():%Y%m%d-%H%M%S}"
     work = out / "work"
     work.mkdir(parents=True, exist_ok=True)
+    homes = bench_homes(out, arms, args)
+    cfg = load_config()
+    for arm in arms:
+        if not arm.startswith("harness") and arm not in cfg["providers"]:
+            raise HarnessError(f"unknown approach {arm!r}: use 'harness[-variant]' or a provider ({', '.join(cfg['providers'])})")
     results_path = out / "results.json"
     results: List[Dict[str, Any]] = json.loads(results_path.read_text()) if results_path.exists() else []
     done = {(r["task"], r["arm"], r["trial"]) for r in results}
@@ -1583,7 +1670,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
     print(f"Benchmark {out}\n{len(tasks)} task(s) x {len(arms)} approach(es) x {args.trials} trial(s); {len(todo)} to run", flush=True)
     for i, (task, arm, trial) in enumerate(todo, 1):
         print(f"[{i}/{len(todo)}] {task['id']} / {arm} / trial {trial} ...", flush=True)
-        result = bench_trial(task, arm, trial, work, args)
+        result = bench_trial(task, arm, trial, work, args, homes)
         if result.get("limited"):
             # A usage limit changes who does the work (fallbacks) or fails the call outright: not a fair sample.
             aside_path = out / "limited-results.json"
@@ -1641,6 +1728,9 @@ def main() -> None:
     p.add_argument("--budget", type=float, default=20, help="USD cap for a solo Claude call (default 20)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out", help="results directory; reusing one resumes unfinished trials")
+    p.add_argument("--config", help="JSON merged into the config for every approach, e.g. to turn providers off")
+    p.add_argument("--arm-config", action="append", metavar="NAME=JSON",
+                   help="config overlay for a harness variant, e.g. harness-classic='{\"fast_path\": false}'")
     sub.add_parser("init", help="write default config and install OpenCode agents")
     p = sub.add_parser("config", help="show config or toggle a provider")
     p.add_argument("provider", nargs="?")
