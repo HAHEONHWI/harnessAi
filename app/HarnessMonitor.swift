@@ -107,6 +107,9 @@ struct RunState: Decodable, Identifiable, Equatable {
     let verify: VerifyResult?
     let completed: Bool?
     let outsideChanges: [String]?
+    let mode: String?
+    let route: String?
+    let requestedRounds: Int?
     let usage: [ProviderUsage]?
     let feedback: String?
     let finalFiles: [String]?
@@ -521,10 +524,11 @@ final class HarnessStore: ObservableObject {
         }
     }
 
-    func start(command: String, rounds: Int, paths: [String]) {
+    func start(command: String, rounds: Int, paths: [String], mode: String? = nil) {
         message = "Starting…"
         let pathArgs = paths.flatMap { ["--path", $0] }
-        Engine.run(["start", "--repo", repoPath, "--rounds", String(rounds)] + pathArgs + ["--", command]) { code, output in
+        let modeArgs = mode.map { ["--mode", $0] } ?? []
+        Engine.run(["start", "--repo", repoPath, "--rounds", String(rounds)] + modeArgs + pathArgs + ["--", command]) { code, output in
             if code == 0 {
                 self.message = nil
                 self.selectedRun = output.split(separator: "\n").last.map(String.init)
@@ -915,10 +919,21 @@ struct ProviderEditor: View {
 }
 
 struct NewTaskSheet: View {
+    var modeHelp: String {
+        let what: String
+        switch mode {
+        case "solo": what = "One agent does the whole task in an isolated worktree and retries on failed verification. No planning or review."
+        case "harness": what = "Claude plans and reviews, workers run on isolated worktrees, and every round is verified."
+        default: what = "One agent tries first (fastest, cheapest). If the project's verify command still fails after two attempts, the full harness takes over."
+        }
+        return what + " Models fall back on usage limits. Nothing touches your project until you press Apply."
+    }
+
     @EnvironmentObject var store: HarnessStore
     @Environment(\.dismiss) private var dismiss
     @State private var command = ""
     @State private var rounds = 3
+    @State private var mode = UserDefaults.standard.string(forKey: "taskMode") ?? "auto"
     @State private var paths: [String] = []
     @State private var typedPath = ""
 
@@ -966,14 +981,20 @@ struct NewTaskSheet: View {
                     }
                 }
             }
+            Picker("Mode", selection: $mode) {
+                Text("Auto").tag("auto")
+                Text("Solo").tag("solo")
+                Text("Harness").tag("harness")
+            }
+            .pickerStyle(.segmented)
             Stepper("Max rounds: \(rounds)", value: $rounds, in: 1...5)
-            Text("Claude plans and reviews, workers run in parallel on isolated worktrees, and models fall back on usage limits. Nothing touches your project until you press Apply.")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(modeHelp).font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Start") {
-                    store.start(command: command.trimmingCharacters(in: .whitespacesAndNewlines), rounds: rounds, paths: paths)
+                    UserDefaults.standard.set(mode, forKey: "taskMode")
+                    store.start(command: command.trimmingCharacters(in: .whitespacesAndNewlines), rounds: rounds, paths: paths, mode: mode)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
@@ -1001,6 +1022,11 @@ struct RunView: View {
                     HStack(spacing: 12) {
                         StatusBadge(status: run.displayStatus)
                         Text("round \(run.round)/\(run.maxRounds)").font(.caption).foregroundStyle(.secondary)
+                        if let route = run.route {
+                            Label(routeLabel(route), systemImage: route == "harness" ? "person.3" : route == "solo" ? "person" : "arrow.up.forward")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .help(run.mode.map { "Mode: \($0)" } ?? "")
+                        }
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
                             Text(formatDuration(run.started, run.ended)).font(.caption).foregroundStyle(.secondary)
                         }
@@ -1039,7 +1065,7 @@ struct RunView: View {
                         }
                         if run.canRetry {
                             Button("Retry", systemImage: "arrow.clockwise") {
-                                store.start(command: run.command, rounds: run.maxRounds, paths: run.scope ?? [])
+                                store.start(command: run.command, rounds: run.requestedRounds ?? run.maxRounds, paths: run.scope ?? [], mode: run.mode)
                             }
                             .buttonStyle(.borderedProminent)
                             .help("Start a new run with the same command, scope, and rounds")
@@ -1115,6 +1141,14 @@ struct TaskRow: View {
             }
         }
         .padding(.vertical, 3)
+    }
+}
+
+func routeLabel(_ route: String) -> String {
+    switch route {
+    case "solo": return "Solo"
+    case "solo+harness": return "Solo → Harness"
+    default: return "Harness"
     }
 }
 
