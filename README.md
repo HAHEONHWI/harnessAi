@@ -27,7 +27,8 @@
 
 벤치마크에서 대부분의 작업은 AI 하나가 처리하는 편이 더 빠르고 저렴했습니다. 그래서 기본 모드(`auto`)는 이렇게 동작합니다.
 
-1. **단독 실행**: `solo_role`(기본 `claude`) 하나가 격리된 worktree에서 작업 전체를 맡습니다. 조율자의 계획·리뷰가 없습니다.
+0. **라우터**: 가벼운 AI 한 번 호출(기본 Claude Sonnet, effort low, 도구·MCP 없이 약 2천 토큰, 몇 초)이 명령, 범위, 저장소 파일 요약, 모델별 특성, 현재 사용량 한도를 보고 단독/하네스와 단독 모델을 고릅니다. 실패하면 `solo_preference` 순서(기본 속도: Claude 먼저, `tokens`면 GPT 먼저)로 진행합니다.
+1. **단독 실행**: 고른 모델 하나가 격리된 worktree에서 작업 전체를 맡습니다. 조율자의 계획·리뷰가 없습니다. `solo_role`에 모델을 적으면 라우터는 경로만 고릅니다.
 2. 프로젝트에 `verify_command`가 있으면 결과를 검증합니다. 실패하면 출력을 들고 다시 시도합니다(`solo_attempts`, 기본 2회).
 3. 그래도 실패하면 **하네스로 승격**해 계획 → 워커 → 리뷰 라운드로 이어갑니다.
 
@@ -38,6 +39,8 @@
 | `auto` (기본) | 단독 실행 → 검증 실패가 계속되면 하네스 |
 | `solo` | 단독 실행만 (검증 실패 시 `max_rounds`까지 재시도) |
 | `harness` | 처음부터 계획·워커·리뷰 |
+
+**사용량 한도 기억**: 모델이 한도에 걸리면 오류 메시지의 재시도 시각(없으면 1시간)을 `~/.ai-harness/limits.json`에 저장하고, 그때까지 모든 run에서 그 모델을 건너뜁니다. 라우터도 이 정보를 보고 고릅니다. 크레딧을 충전했다면 `harness limits clear [모델]` 또는 앱 Models 패널의 우클릭 메뉴로 지웁니다.
 
 앱의 New Task에서 고르거나 CLI에서 `--mode`로 지정합니다. 기본값은 설정의 `routing`입니다. run 화면에는 실제 경로(Solo, Solo → Harness, Harness)가 표시됩니다.
 
@@ -155,6 +158,7 @@ $harness config kimi off
 | `apply <id>` | `final.patch`를 프로젝트에 적용 |
 | `cleanup [--delete] <id>` | worktree 정리 (`--delete`면 run 폴더도 삭제) |
 | `config [provider on\|off]` | 설정 보기, 모델 on/off |
+| `limits [clear [provider]]` | 기억된 사용량 한도 보기, 지우기 |
 | `init` | 기본 설정과 OpenCode 에이전트 설치 |
 
 ## 프로젝트별 설정

@@ -69,8 +69,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # auto: one agent does the task alone (no coordinator); escalate to the full harness only if verification
     # still fails after solo_attempts. solo: never escalate. harness: always plan/work/review.
     "routing": "auto",
-    "solo_role": "claude",
+    "solo_role": "auto",  # "auto": the router picks the model per task; or a provider id
     "solo_attempts": 2,
+    # Router: one short, tool-free call that picks solo vs harness and the solo model from a repo summary.
+    "router_role": "claude",
+    "router_overrides": {"claude": {"model": "sonnet", "effort": "low", "lean": True}, "sol": {"effort": "low"},
+                         "luna": {"effort": "low"}},
+    "solo_preference": "speed",  # fallback order when the router is unavailable: speed (claude first) or tokens (sol first)
 }
 PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
 WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
@@ -134,10 +139,56 @@ def load_config() -> Dict[str, Any]:
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
     for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role", "coordinator", "fast_path",
-                "focused_review", "prefer_single_worker", "routing", "solo_role", "solo_attempts"):
+                "focused_review", "prefer_single_worker", "routing", "solo_role", "solo_attempts",
+                "router_role", "router_overrides", "solo_preference"):
         if key in user:
             cfg[key] = user[key]
     return cfg
+
+
+LIMITS_PATH = HOME_DIR / "limits.json"
+RESET_RE = re.compile(r"try again (?:at|after) (?:(?P<date>[A-Z][a-z]{2,8} \d{1,2}(?:st|nd|rd|th)?,? \d{4}),? )?"
+                      r"(?P<time>\d{1,2}:\d{2} ?[AP]M)", re.I)
+HOURS_RE = re.compile(r"(\d+)-hour usage limit", re.I)
+
+
+def limit_until(output: str) -> float:
+    """When a provider's usage limit resets, from its error text; one hour when it does not say."""
+    tail = "\n".join(output.strip().splitlines()[-40:])
+    m = RESET_RE.search(tail)
+    if m:
+        stamp = f"{m.group('date') or ''} {m.group('time')}".strip()
+        stamp = re.sub(r"(\d)(st|nd|rd|th)", r"\1", stamp).replace(",", "").replace(" ?", " ")
+        for fmt in ("%b %d %Y %I:%M %p", "%B %d %Y %I:%M %p", "%I:%M %p", "%I:%M%p"):
+            try:
+                t = dt.datetime.strptime(stamp, fmt)
+            except ValueError:
+                continue
+            if fmt.startswith("%I"):
+                today = dt.datetime.now()
+                t = t.replace(year=today.year, month=today.month, day=today.day)
+                if t < today:
+                    t += dt.timedelta(days=1)
+            return t.timestamp()
+    m = HOURS_RE.search(tail)
+    return now() + (int(m.group(1)) * 3600 if m else 3600)
+
+
+def load_limits() -> Dict[str, float]:
+    """Providers known to be over their usage limit, with the time it resets; expired entries dropped."""
+    path = HOME_DIR / "limits.json"
+    try:
+        data = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return {p: float(t) for p, t in data.items() if float(t) > now()}
+
+
+def record_limit(provider: str, until: float) -> None:
+    limits = load_limits()
+    limits[provider] = max(until, limits.get(provider, 0))
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    write_json(HOME_DIR / "limits.json", limits)
 
 
 def is_custom(name: str, pcfg: Optional[Dict[str, Any]]) -> bool:
@@ -354,6 +405,12 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
     if provider == "kimi":
         agent = "harness-kimi-writer" if write else "harness-kimi-reader"
         return ["opencode", "run", "--agent", agent, "--model", model, "--dir", str(workdir), prompt], None
+    if provider == "claude" and cfg.get("lean"):
+        # Tool-free call (router): no default system prompt, tools, MCP servers or skills — about 2k tokens instead of ~47k.
+        return ["claude", "-p", prompt, "--model", model or "sonnet", "--effort", cfg.get("effort", "low"),
+                "--output-format", "stream-json", "--verbose", "--tools", "",
+                "--system-prompt", "You route coding tasks for a multi-agent harness. Reply with one line of JSON only.",
+                "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"], None
     if provider == "claude":
         tools = "Read,Glob,Grep,Edit,Write,Bash" if mode == "solo" else "Read,Glob,Grep,Edit,Write" if write else "Read,Glob,Grep"
         cmd = ["claude", "-p", prompt, "--model", model or "opus", "--effort", cfg.get("effort", "max"),
@@ -419,12 +476,17 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         cfg = load_config()  # re-read so on/off toggles apply mid-run
         pcfg = cfg["providers"].get(provider)
         if pcfg and overrides:
-            pcfg = {**pcfg, **overrides}
+            # Either flat ({"max_budget_usd": 20}) or per provider ({"claude": {"model": "sonnet"}}).
+            per = overrides.get(provider) if isinstance(overrides.get(provider), dict) else None
+            nested = any(isinstance(v, dict) for v in overrides.values())
+            pcfg = {**pcfg, **(per or ({} if nested else overrides))}
         skip = None
         if not pcfg or not pcfg.get("enabled", False):
             skip = "disabled"
         elif provider in run.exhausted:
             skip = "limit or no output earlier in this run"
+        elif provider in load_limits():
+            skip = f"usage limit until {dt.datetime.fromtimestamp(load_limits()[provider]):%m-%d %H:%M}"
         elif not provider_cli(provider, pcfg):
             skip = "no command configured"
         elif not shutil.which(provider_cli(provider, pcfg)):
@@ -465,6 +527,8 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
             return result
         if status in ("limit", "no-output"):
             run.exhausted.add(provider)
+            if status == "limit":
+                record_limit(provider, limit_until(output))
             reason = "hit a usage/rate limit" if status == "limit" else "finished without producing output"
             run.event(f"{base_name}: {provider} {reason}, falling back")
             continue
@@ -1110,6 +1174,94 @@ def run_round(run: Run, integration: Path, round_no: int, feedback: Optional[str
     return review
 
 
+PROVIDER_TRAITS = {
+    "claude": "Claude Opus. Fastest single agent in our benchmarks (about 3 min on hard tasks), strong reasoning, debugging and "
+              "spec-following; uses more tokens than GPT.",
+    "sol": "Codex GPT Sol. Fewest tokens (about 140k on hard tasks) but about 2x slower than Claude; strong implementation. "
+           "Its 5-hour quota covers only 2-3 large tasks.",
+    "luna": "Codex GPT Luna. Faster, cheaper Codex model for bounded implementation and QA; shares the Codex quota.",
+    "kimi": "OpenCode Kimi. Cheap but slow; docs, broad repetitive edits. Small 5-hour quota.",
+    "antigravity": "Google Antigravity. Frontend/UI and alternative implementations; cannot run shell commands in sandbox mode.",
+}
+
+
+def available_providers(cfg: Dict[str, Any]) -> List[str]:
+    limits = load_limits()
+    return [n for n, p in cfg["providers"].items()
+            if p.get("enabled") and n not in limits and provider_cli(n, p) and shutil.which(provider_cli(n, p))]
+
+
+def repo_summary(workdir: Path, limit: int = 80) -> str:
+    files = [f for f in git(workdir, "ls-files").splitlines() if f]
+    tops: Dict[str, int] = {}
+    for f in files:
+        tops[f.split("/", 1)[0] + ("/" if "/" in f else "")] = tops.get(f.split("/", 1)[0] + ("/" if "/" in f else ""), 0) + 1
+    sized = sorted(files, key=lambda f: (workdir / f).stat().st_size if (workdir / f).is_file() else 0, reverse=True)[:limit]
+    lines = [f"{len(files)} tracked files. Top level: " + ", ".join(f"{k} ({v})" for k, v in sorted(tops.items()))]
+    lines += [f"- {f} ({(workdir / f).stat().st_size // 1024} KB)" for f in sized if (workdir / f).is_file()]
+    return "\n".join(lines)
+
+
+def router_prompt(run: Run, workdir: Path, candidates: List[str], cfg: Dict[str, Any], allow_harness: bool) -> str:
+    scope = run.data.get("scope") or []
+    traits = "\n".join(f"- {n}: {PROVIDER_TRAITS.get(n) or cfg['providers'][n].get('notes') or cfg['providers'][n].get('label', n)}"
+                       for n in candidates)
+    limited = load_limits()
+    limited_text = ("\nUnavailable now (usage limit): " + ", ".join(
+        f"{p} until {dt.datetime.fromtimestamp(t):%H:%M}" for p, t in limited.items())) if limited else ""
+    harness_rule = ('"harness" only when the task is large and splits into independent parts that each need many minutes, '
+                    'or touches auth, payments, secrets or deployment and deserves a second review; otherwise "solo". '
+                    if allow_harness else 'always "solo". ')
+    return f"""Route a coding task. Answer from the information below only; do not open files or use tools.
+
+Task:
+{clip(run.data['command'], 4000)}
+{"Scope: " + ", ".join(scope) if scope else ""}
+Verification command: {verify_command(run.repo) or "(none)"}
+
+Repository:
+{repo_summary(workdir)}
+
+Available models:
+{traits}{limited_text}
+
+Benchmark facts: every model solved well-specified tasks equally well; a single agent was 2-3x faster and cheaper than the multi-agent harness.
+Pick route {harness_rule}Pick the solo model that fits the task and is available; when several fit, prefer {"speed (claude)" if cfg.get("solo_preference", "speed") == "speed" else "fewer tokens (sol)"}.
+
+Reply with one line of JSON only:
+{{"route": "solo", "role": "<model id>", "reason": "<under 15 words>"}}"""
+
+
+def route_task(run: Run, integration: Path, allow_harness: bool) -> Dict[str, Any]:
+    """Ask the router once; fall back to the preference order if it fails or answers nonsense."""
+    cfg = load_config()
+    candidates = available_providers(cfg)
+    order = ["claude", "sol", "luna", "kimi", "antigravity"]
+    if cfg.get("solo_preference") == "tokens":
+        order = ["sol", "luna", "claude", "kimi", "antigravity"]
+    default_role = next((p for p in order if p in candidates), next(iter(candidates), "claude"))
+    decision = {"route": "solo", "role": default_role, "reason": "default order", "by": "default"}
+    if not candidates:
+        return decision
+    run.update(status="routing")
+    task = run.add_task(name="route", kind="route", round=0, role=str(cfg.get("router_role") or "claude"))
+    try:
+        text = call_agent(run, task, task["role"], "read", integration,
+                          router_prompt(run, integration, candidates, cfg, allow_harness),
+                          overrides=cfg.get("router_overrides") or None)
+        data = extract_json(text if "BEGIN_JSON" in text else f"BEGIN_JSON {text[text.find('{'):text.rfind('}') + 1]} END_JSON")
+        route = data.get("route") if data.get("route") in ("solo", "harness") and allow_harness else "solo"
+        role = data.get("role") if data.get("role") in candidates else default_role
+        decision = {"route": route, "role": role, "reason": clip(str(data.get("reason", "")), 200), "by": task.get("provider")}
+        run.set_task(task, state="done", ended=now())
+    except Stopped:
+        raise
+    except HarnessError as exc:
+        run.set_task(task, state="failed", error=str(exc), ended=now())
+        run.event(f"router unavailable ({exc}); using {default_role}")
+    return decision
+
+
 def solo_task_prompt(run: Run, feedback: Optional[str]) -> str:
     scope = run.data.get("scope") or []
     scope_text = f"\nOnly change these files/folders: {', '.join(scope)}\n" if scope else ""
@@ -1131,7 +1283,9 @@ When finished, report changed files, assumptions, and the checks you actually ra
 def run_solo_attempt(run: Run, integration: Path, round_no: int, feedback: Optional[str]) -> Dict[str, Any]:
     """One agent does the whole task in its own worktree; allowed changes are integrated without a coordinator."""
     cfg = load_config()
-    role = str(cfg.get("solo_role") or "claude")
+    role = run.data.get("solo_role") or str(cfg.get("solo_role") or "claude")
+    if role == "auto":
+        role = "claude"
     run.update(round=round_no, status="working")
     record: Dict[str, Any] = {"round": round_no, "plan": {"solo": True, "role": role}, "review": None}
     with run.lock:
@@ -1243,7 +1397,20 @@ def execute(run: Run) -> None:
         harness_rounds = int(run.data["max_rounds"])
         solo_rounds = {"harness": 0, "solo": harness_rounds}.get(mode, max(1, int(cfg.get("solo_attempts", 2))))
         total = solo_rounds + (harness_rounds if mode == "auto" else 0) if mode != "harness" else harness_rounds
-        run.update(mode=mode, route="harness" if mode == "harness" else "solo", max_rounds=total)
+        if mode in ("auto", "solo"):
+            fixed = str(cfg.get("solo_role") or "auto")
+            if fixed == "auto" or mode == "auto":
+                decision = route_task(run, integration, allow_harness=mode == "auto")
+                if fixed != "auto":  # the user pinned the solo model; the router only picks the route
+                    decision["role"] = fixed
+            else:
+                decision = {"route": "solo", "role": fixed, "reason": "configured solo_role", "by": "config"}
+            run.update(router=decision, solo_role=decision["role"])
+            run.event(f"route: {decision['route']}" + (f" on {decision['role']}" if decision["route"] == "solo" else "")
+                      + (f" ({decision['reason']})" if decision.get("reason") else ""))
+            if decision["route"] == "harness":
+                solo_rounds, total = 0, harness_rounds
+        run.update(mode=mode, route="harness" if solo_rounds == 0 else "solo", max_rounds=total)
         run.event(f"routing: {mode}" + (f" (solo up to {solo_rounds} attempt(s), then harness)" if mode == "auto" else ""))
         for round_no in range(1, total + 1):
             if round_no <= solo_rounds:
@@ -1354,7 +1521,7 @@ def pid_alive(pid: Optional[int]) -> bool:
         return True
 
 
-ACTIVE = {"queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "verifying", "summarizing"}
+ACTIVE = {"queued", "snapshot", "routing", "planning", "working", "security-review", "reviewing", "integrating", "verifying", "summarizing"}
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -1470,6 +1637,18 @@ def cmd_init(_args: argparse.Namespace) -> None:
     for name, body in KIMI_AGENTS.items():
         (OPENCODE_AGENTS / name).write_text(body)
     print(f"Installed OpenCode agents in {OPENCODE_AGENTS}")
+
+
+def cmd_limits(args: argparse.Namespace) -> None:
+    limits = load_limits()
+    if args.action == "clear":
+        for p in ([args.provider] if args.provider else list(limits)):
+            limits.pop(p, None)
+        write_json(HOME_DIR / "limits.json", limits)
+    for p, t in load_limits().items():
+        print(f"{p:<12} limited until {dt.datetime.fromtimestamp(t):%Y-%m-%d %H:%M}")
+    if not load_limits():
+        print("No remembered usage limits.")
 
 
 def cmd_config(args: argparse.Namespace) -> None:
@@ -1840,6 +2019,9 @@ def main() -> None:
     p.add_argument("--config", help="JSON merged into the config for every approach, e.g. to turn providers off")
     p.add_argument("--arm-config", action="append", metavar="NAME=JSON",
                    help="config overlay for a harness variant, e.g. harness-classic='{\"fast_path\": false}'")
+    p = sub.add_parser("limits", help="show or clear remembered usage limits")
+    p.add_argument("action", nargs="?", choices=("clear",))
+    p.add_argument("provider", nargs="?")
     sub.add_parser("init", help="write default config and install OpenCode agents")
     p = sub.add_parser("config", help="show config or toggle a provider")
     p.add_argument("provider", nargs="?")
@@ -1851,7 +2033,8 @@ def main() -> None:
             cmd_start(args, foreground=args.cmd == "run")
         else:
             {"resume": cmd_resume, "status": cmd_status, "stop": cmd_stop, "list": cmd_list, "apply": cmd_apply,
-             "cleanup": cmd_cleanup, "init": cmd_init, "config": cmd_config, "bench": cmd_bench}[args.cmd](args)
+             "cleanup": cmd_cleanup, "init": cmd_init, "config": cmd_config, "bench": cmd_bench,
+             "limits": cmd_limits}[args.cmd](args)
     except HarnessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -22,6 +22,7 @@
 - Engine syntax check: `python3 -m py_compile engine/harness.py`
 - Benchmark task check: `python3 engine/harness.py bench validate`
 - No automated test suite exists. Verify engine changes with a throwaway Git repo under a temp directory, never with real projects.
+- Fake agent CLIs for tests: the engine appends `/opt/homebrew/bin` and `~/.local/bin` to PATH, so real CLIs installed there can still run. Point `AI_HARNESS_HOME` at a temp dir and disable every provider you did not fake, or fallbacks will spend real quota.
 
 ## Development Rules
 

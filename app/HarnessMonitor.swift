@@ -86,6 +86,13 @@ struct VerifyResult: Decodable, Equatable {
     let exit: Int
 }
 
+struct RouterDecision: Decodable, Equatable {
+    let route: String
+    let role: String
+    let reason: String?
+    let by: String?
+}
+
 struct EventItem: Decodable, Equatable {
     let t: Double
     let msg: String
@@ -110,13 +117,15 @@ struct RunState: Decodable, Identifiable, Equatable {
     let mode: String?
     let route: String?
     let requestedRounds: Int?
+    let soloRole: String?
+    let router: RouterDecision?
     let usage: [ProviderUsage]?
     let feedback: String?
     let finalFiles: [String]?
     let tasks: [TaskState]
     let events: [EventItem]
 
-    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "security-review", "reviewing", "integrating", "verifying", "summarizing"]
+    static let activeStatuses: Set<String> = ["queued", "snapshot", "planning", "working", "routing", "security-review", "reviewing", "integrating", "verifying", "summarizing"]
 
     var engineAlive: Bool {
         guard let pid else { return false }
@@ -142,6 +151,7 @@ struct ProviderInfo: Identifiable, Equatable {
     let model: String
     let enabled: Bool
     let fallback: [String]
+    var limitedUntil: Date? = nil
     var builtin: Bool { Self.builtins.contains(id) }
 }
 
@@ -327,6 +337,9 @@ enum Engine {
         let providers = json["providers"] as? [String: [String: Any]] ?? [:]
         let fallback = json["fallback"] as? [String: [String]] ?? [:]
         let custom = providers.keys.filter { !ProviderInfo.builtins.contains($0) }.sorted()
+        let limitsData = (try? Data(contentsOf: home.appendingPathComponent("limits.json"))) ?? Data()
+        let limits = ((try? JSONSerialization.jsonObject(with: limitsData)) as? [String: Double] ?? [:])
+            .compactMapValues { $0 > Date().timeIntervalSince1970 ? Date(timeIntervalSince1970: $0) : nil }
         return (ProviderInfo.builtins + custom).compactMap { id in
             guard let p = providers[id] else { return nil }
             return ProviderInfo(
@@ -334,7 +347,8 @@ enum Engine {
                 label: p["label"] as? String ?? id,
                 model: p["model"] as? String ?? "",
                 enabled: p["enabled"] as? Bool ?? true,
-                fallback: fallback[id] ?? []
+                fallback: fallback[id] ?? [],
+                limitedUntil: limits[id]
             )
         }
     }
@@ -789,6 +803,11 @@ struct ModelsPanel: View {
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 4) {
                                 Text(provider.label).font(.callout)
+                                if let until = provider.limitedUntil {
+                                    Text("limit until " + until.formatted(date: .omitted, time: .shortened))
+                                        .font(.caption2).foregroundStyle(.orange)
+                                        .help("Usage limit reached; skipped until then. Clear with `harness limits clear \(provider.id)`.")
+                                }
                                 if let used = store.projectUsage[provider.id], let total = used.total, total > 0 {
                                     Text(formatTokens(total)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                                         .help("Tokens used by this model across this project's runs: " + used.detail)
@@ -802,7 +821,12 @@ struct ModelsPanel: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                 }
-                .contextMenu { Button("Edit…") { editing = EditTarget(id: provider.id) } }
+                .contextMenu {
+                    Button("Edit…") { editing = EditTarget(id: provider.id) }
+                    if provider.limitedUntil != nil {
+                        Button("Clear Usage Limit") { Engine.run(["limits", "clear", provider.id]) { _, _ in store.refresh() } }
+                    }
+                }
             }
         }
         .padding(10)
@@ -1023,9 +1047,12 @@ struct RunView: View {
                         StatusBadge(status: run.displayStatus)
                         Text("round \(run.round)/\(run.maxRounds)").font(.caption).foregroundStyle(.secondary)
                         if let route = run.route {
-                            Label(routeLabel(route), systemImage: route == "harness" ? "person.3" : route == "solo" ? "person" : "arrow.up.forward")
+                            let model = route == "harness" ? nil : (run.soloRole.map { id in store.providers.first { $0.id == id }?.label ?? id })
+                            Label(routeLabel(route) + (model.map { " · \($0)" } ?? ""),
+                                  systemImage: route == "harness" ? "person.3" : route == "solo" ? "person" : "arrow.up.forward")
                                 .font(.caption).foregroundStyle(.secondary)
-                                .help(run.mode.map { "Mode: \($0)" } ?? "")
+                                .help([run.mode.map { "Mode: \($0)" }, run.router?.reason.map { "Router: \($0)" }]
+                                    .compactMap { $0 }.joined(separator: "\n"))
                         }
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
                             Text(formatDuration(run.started, run.ended)).font(.caption).foregroundStyle(.secondary)
