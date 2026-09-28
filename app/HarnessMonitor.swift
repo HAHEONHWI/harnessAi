@@ -145,7 +145,7 @@ struct RunState: Decodable, Identifiable, Equatable {
 }
 
 struct ProviderInfo: Identifiable, Equatable {
-    static let builtins = ["sol", "luna", "kimi", "claude", "antigravity"]
+    static let builtins = ["sol", "luna", "kimi", "claude", "antigravity", "cline"]
     let id: String
     let label: String
     let model: String
@@ -168,6 +168,9 @@ struct ProviderDraft {
     var worker = true
     var notes = ""
     var fallback: [String] = []
+    var budget = ""  // Claude: max USD per call
+    var timeout = ""  // minutes; empty = global call_timeout_minutes
+    var skipPermissions = false  // Antigravity: auto-approve every tool (no sandbox)
 
     /// Splits a shell-like line into arguments; single/double quotes group words.
     static func split(_ line: String) -> [String] {
@@ -336,12 +339,13 @@ enum Engine {
         let json = readConfig()
         let providers = json["providers"] as? [String: [String: Any]] ?? [:]
         let fallback = json["fallback"] as? [String: [String]] ?? [:]
+        let removed = Set(json["removed_providers"] as? [String] ?? [])
         let custom = providers.keys.filter { !ProviderInfo.builtins.contains($0) }.sorted()
         let limitsData = (try? Data(contentsOf: home.appendingPathComponent("limits.json"))) ?? Data()
         let limits = ((try? JSONSerialization.jsonObject(with: limitsData)) as? [String: Double] ?? [:])
             .compactMapValues { $0 > Date().timeIntervalSince1970 ? Date(timeIntervalSince1970: $0) : nil }
         return (ProviderInfo.builtins + custom).compactMap { id in
-            guard let p = providers[id] else { return nil }
+            guard let p = providers[id], !removed.contains(id) else { return nil }
             return ProviderInfo(
                 id: id,
                 label: p["label"] as? String ?? id,
@@ -375,7 +379,10 @@ enum Engine {
             effort: p["effort"] as? String ?? "", command: ProviderDraft.join(strings("command")),
             readArgs: ProviderDraft.join(strings("read_args")), writeArgs: ProviderDraft.join(strings("write_args")),
             stdin: p["stdin"] as? Bool ?? false, worker: p["worker"] as? Bool ?? true, notes: p["notes"] as? String ?? "",
-            fallback: (json["fallback"] as? [String: [String]])?[id] ?? []
+            fallback: (json["fallback"] as? [String: [String]])?[id] ?? [],
+            budget: (p["max_budget_usd"] as? NSNumber).map { "\($0)" } ?? "",
+            timeout: (p["timeout_minutes"] as? NSNumber).map { "\($0)" } ?? "",
+            skipPermissions: p["skip_permissions"] as? Bool ?? false
         )
     }
 
@@ -386,15 +393,18 @@ enum Engine {
         var p = providers[d.id] ?? ["enabled": true]
         p["label"] = d.label.isEmpty ? d.id : d.label
         p["model"] = d.model
+        p["notes"] = d.notes.isEmpty ? nil : d.notes
+        p["timeout_minutes"] = Int(d.timeout.trimmingCharacters(in: .whitespaces))
         if ProviderInfo.builtins.contains(d.id) {
-            if !d.effort.isEmpty { p["effort"] = d.effort }
+            p["effort"] = d.effort.isEmpty ? nil : d.effort
+            if d.id == "claude" { p["max_budget_usd"] = Double(d.budget) ?? p["max_budget_usd"] }
+            if d.id == "antigravity" { p["skip_permissions"] = d.skipPermissions }
         } else {
             p["command"] = ProviderDraft.split(d.command)
             p["read_args"] = ProviderDraft.split(d.readArgs)
             p["write_args"] = ProviderDraft.split(d.writeArgs)
             p["stdin"] = d.stdin
             p["worker"] = d.worker
-            p["notes"] = d.notes
         }
         providers[d.id] = p
         var fallback = json["fallback"] as? [String: [String]] ?? [:]
@@ -404,9 +414,14 @@ enum Engine {
         writeConfig(json)
     }
 
+    /// Built-in models go on removed_providers so the engine's defaults do not bring them back.
     static func delete(_ id: String) {
-        guard !ProviderInfo.builtins.contains(id) else { return }
         var json = readConfig()
+        if ProviderInfo.builtins.contains(id) {
+            var removed = json["removed_providers"] as? [String] ?? []
+            if !removed.contains(id) { removed.append(id) }
+            json["removed_providers"] = removed
+        }
         var providers = json["providers"] as? [String: [String: Any]] ?? [:]
         providers[id] = nil
         var fallback = json["fallback"] as? [String: [String]] ?? [:]
@@ -414,8 +429,19 @@ enum Engine {
         for key in fallback.keys { fallback[key]?.removeAll { $0 == id } }
         json["providers"] = providers
         json["fallback"] = fallback
-        if json["summary_role"] as? String == id { json["summary_role"] = "luna" }
+        if json["summary_role"] as? String == id { json["summary_role"] = "" }
+        for key in ["solo_role", "router_role", "coordinator"] where json[key] as? String == id { json[key] = nil }
         writeConfig(json)
+    }
+
+    static var removedBuiltins: [String] { readConfig()["removed_providers"] as? [String] ?? [] }
+
+    /// Brings deleted built-in models back with their default settings.
+    static func restoreDefaults(completion: @escaping @MainActor () -> Void) {
+        var json = readConfig()
+        json["removed_providers"] = nil
+        writeConfig(json)
+        run(["init"]) { _, _ in completion() }
     }
 }
 
@@ -789,8 +815,15 @@ struct ModelsPanel: View {
             HStack {
                 Text("Models").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
-                Button("Add model", systemImage: "plus") { editing = EditTarget(id: nil) }
-                    .labelStyle(.iconOnly).buttonStyle(.borderless).controlSize(.small).help("Add an agent CLI")
+                Menu {
+                    Button("Add Model…") { editing = EditTarget(id: nil) }
+                    if !Engine.removedBuiltins.isEmpty {
+                        Button("Restore Default Models") { Engine.restoreDefaults { store.refresh() } }
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().controlSize(.small).help("Add or restore models")
             }
             if store.providers.isEmpty {
                 Text("Run build.sh to install the engine.").font(.caption).foregroundStyle(.secondary)
@@ -843,6 +876,7 @@ struct ProviderEditor: View {
     let original: String?
     @State var draft: ProviderDraft
     @State private var confirmDelete = false
+    @State private var modelChoices: [String] = []
 
     var isBuiltin: Bool { original.map(ProviderInfo.builtins.contains) ?? false }
     var others: [String] { store.providers.map(\.id).filter { $0 != draft.id && !draft.fallback.contains($0) } }
@@ -870,11 +904,30 @@ struct ProviderEditor: View {
                     if let idError, !draft.id.isEmpty { Text(idError).font(.caption).foregroundStyle(.red) }
                 }
                 TextField("Name", text: $draft.label, prompt: Text("Gemini CLI"))
-                TextField("Model", text: $draft.model, prompt: Text("(CLI default)"))
-                if isBuiltin {
-                    if ["sol", "luna", "claude"].contains(draft.id) {
-                        TextField("Effort", text: $draft.effort, prompt: Text("high"))
+                HStack {
+                    TextField("Model", text: $draft.model, prompt: Text("(CLI default)"))
+                    if !modelChoices.isEmpty {
+                        Menu("Choose") {
+                            ForEach(modelChoices, id: \.self) { m in Button(m) { draft.model = m } }
+                        }
+                        .fixedSize()
                     }
+                }
+                if isBuiltin {
+                    if ["sol", "luna", "claude", "cline"].contains(draft.id) {
+                        TextField("Effort", text: $draft.effort, prompt: Text(draft.id == "cline" ? "medium" : "high"))
+                    }
+                    if draft.id == "claude" {
+                        TextField("Max cost per call (USD)", text: $draft.budget, prompt: Text("5"))
+                    }
+                    if draft.id == "antigravity" {
+                        Toggle("Auto-approve every tool (no sandbox)", isOn: $draft.skipPermissions)
+                        if draft.skipPermissions {
+                            Text("Antigravity can run any shell command without asking and has edited the real project before. Use only on trusted projects.")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    TextField("Notes for coordinator and router", text: $draft.notes, prompt: Text("(built-in description)"))
                 } else {
                     Section {
                         TextField("Command", text: $draft.command, prompt: Text("gemini -p {prompt} --model {model}"))
@@ -885,12 +938,13 @@ struct ProviderEditor: View {
                         TextField("Editing args", text: $draft.writeArgs, prompt: Text("--yolo")).font(.body.monospaced())
                         Toggle("Send prompt on stdin", isOn: $draft.stdin)
                         Toggle("Coordinator may assign work", isOn: $draft.worker)
-                        TextField("Notes for coordinator", text: $draft.notes, prompt: Text("Fast and cheap; docs and repetitive edits"))
+                        TextField("Notes for coordinator and router", text: $draft.notes, prompt: Text("Fast and cheap; docs and repetitive edits"))
                     } footer: {
                         Text("Placeholders: {prompt} {model} {workdir} {message_file}. Output is what the CLI prints, or {message_file} if it writes one. The CLI runs in an isolated worktree; the harness cannot enforce read-only mode, so pass the CLI's own flags.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                TextField("Timeout (minutes)", text: $draft.timeout, prompt: Text("(global default)"))
                 Section("Fallback order") {
                     ForEach(Array(draft.fallback.enumerated()), id: \.element) { index, id in
                         HStack {
@@ -914,7 +968,7 @@ struct ProviderEditor: View {
             }
             .formStyle(.grouped)
             HStack {
-                if original != nil && !isBuiltin {
+                if original != nil {
                     Button("Delete", role: .destructive) { confirmDelete = true }
                 }
                 Spacer()
@@ -929,7 +983,13 @@ struct ProviderEditor: View {
             }
         }
         .padding(20)
-        .frame(width: 520, height: isBuiltin ? 420 : 640)
+        .frame(width: 540, height: isBuiltin ? 600 : 700)
+        .task {
+            guard let id = original ?? (draft.id.isEmpty ? nil : draft.id) else { return }
+            Engine.run(["models", id]) { code, output in
+                if code == 0 { modelChoices = output.split(separator: "\n").map(String.init).filter { !$0.isEmpty } }
+            }
+        }
         .confirmationDialog("Delete \(draft.label)?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
                 Engine.delete(draft.id)
@@ -937,7 +997,10 @@ struct ProviderEditor: View {
                 dismiss()
             }
         } message: {
-            Text("It is also removed from other models' fallback order.")
+            Text(draft.id == "claude"
+                 ? "Claude plans and reviews in harness mode and routes tasks by default. Set another coordinator and router first, or harness runs will fail. It is also removed from fallback orders."
+                 : isBuiltin ? "You can bring it back with Restore Default Models. It is also removed from other models' fallback order."
+                 : "It is also removed from other models' fallback order.")
         }
     }
 }
