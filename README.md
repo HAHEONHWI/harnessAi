@@ -53,6 +53,7 @@
 | `kimi` | OpenCode `kimi-for-coding` | 저비용 반복 작업, 문서 | luna → antigravity → claude |
 | `claude` | Claude Code `opus` (effort high) | 계획·리뷰 (조율자), 보안 리뷰 | sol → luna → kimi → antigravity |
 | `antigravity` | `agy` | UI·대안 구현 | kimi → luna → claude |
+| `cline` | Cline CLI `stealth/pixel-canary` (무료) | 프론트엔드, 대안 구현 | antigravity → luna → claude |
 
 - 다음 모델로 넘어가는 조건: 사용량·쿼터·rate limit 오류, 모델 off, CLI 미설치.
 - 한도에 걸린 모델은 그 run이 끝날 때까지 다시 시도하지 않습니다.
@@ -91,6 +92,23 @@ python3 engine/harness.py bench --arms harness,harness-classic,claude \
 ```
 
 문제 목록과 추가 방법은 [bench/README.md](bench/README.md)를 보세요.
+
+## Cline (Pixel Canary)
+
+Cline 계정에 로그인된 Cline CLI로 `stealth/pixel-canary`(무료 스텔스 모델)를 씁니다. **이 모델에 보낸 프롬프트와 코드는 학습에 쓰일 수 있으니** 비공개 코드에는 끄거나 삭제하세요.
+
+```bash
+npm install -g cline
+```
+```bash
+codesign --force --sign - "$(npm root -g)/cline/bin/.cline" "$(npm root -g)/cline/node_modules/@cline/cli-darwin-arm64/bin/cline"
+```
+
+macOS에서 CLI가 아무 출력 없이 종료(exit 137)되면 두 번째 명령으로 서명을 다시 합니다. 로그인은 Cline 데스크톱 앱과 공유됩니다. 스텔스 모델이 응답하지 않으면 `timeout_minutes`(기본 20분) 뒤 다음 모델로 넘어갑니다.
+
+## 모델 편집
+
+앱 Models 패널에서 연필(또는 우클릭 → Edit)로 모든 모델을 편집하고 삭제할 수 있습니다. 기본 모델도 모델 ID(목록에서 선택, Antigravity는 `agy models` 실시간 목록), effort, Claude 호출당 비용 상한, Antigravity 권한 자동 승인, 시간 제한, 조율자·라우터용 설명, fallback 순서를 바꿀 수 있습니다. 삭제한 기본 모델은 `+` 메뉴의 Restore Default Models로 되돌립니다. CLI에서는 `harness models <모델>`로 쓸 수 있는 ID를 봅니다.
 
 ## 다른 AI 추가
 

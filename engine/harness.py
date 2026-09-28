@@ -48,6 +48,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "kimi": {"label": "OpenCode Kimi", "enabled": True, "model": "kimi-code-plan-global/kimi-for-coding"},
         "claude": {"label": "Claude Opus", "enabled": True, "model": "opus", "effort": "high", "max_budget_usd": 5},
         "antigravity": {"label": "Antigravity", "enabled": True, "model": ""},
+        # Cline CLI signed in to a Cline account; stealth/pixel-canary is free but prompts may be used for training.
+        "cline": {"label": "Cline Pixel Canary", "enabled": True, "model": "stealth/pixel-canary", "effort": "medium",
+                  "timeout_minutes": 20},
     },
     "fallback": {
         "sol": ["kimi", "claude", "antigravity"],
@@ -55,6 +58,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "kimi": ["luna", "antigravity", "claude"],
         "claude": ["sol", "luna", "kimi", "antigravity"],
         "antigravity": ["kimi", "luna", "claude"],
+        "cline": ["antigravity", "luna", "claude"],
     },
     "max_rounds": 3,
     "max_workers": 4,
@@ -77,8 +81,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                          "luna": {"effort": "low"}},
     "solo_preference": "speed",  # fallback order when the router is unavailable: speed (claude first) or tokens (sol first)
 }
-PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy"}
-WORKER_ROLES = ("luna", "kimi", "antigravity", "claude", "sol")  # built-in worker roles
+PROVIDER_CLI = {"sol": "codex", "luna": "codex", "kimi": "opencode", "claude": "claude", "antigravity": "agy", "cline": "cline"}
+WORKER_ROLES = ("luna", "kimi", "antigravity", "cline", "claude", "sol")  # built-in worker roles
 PLACEHOLDER_RE = re.compile(r"\{(prompt|model|workdir|message_file)\}")
 
 
@@ -138,6 +142,13 @@ def load_config() -> Dict[str, Any]:
     for name, values in user.get("providers", {}).items():
         cfg["providers"].setdefault(name, {}).update(values)
     cfg["fallback"].update(user.get("fallback", {}))
+    # Built-in providers the user deleted stay deleted (DEFAULT_CONFIG would otherwise bring them back).
+    removed = set(user.get("removed_providers", []))
+    for name in removed:
+        cfg["providers"].pop(name, None)
+        cfg["fallback"].pop(name, None)
+    cfg["fallback"] = {k: [p for p in v if p not in removed] for k, v in cfg["fallback"].items()}
+    cfg["removed_providers"] = sorted(removed)
     for key in ("max_rounds", "max_workers", "call_timeout_minutes", "summary_role", "coordinator", "fast_path",
                 "focused_review", "prefer_single_worker", "routing", "solo_role", "solo_attempts",
                 "router_role", "router_overrides", "solo_preference"):
@@ -203,9 +214,10 @@ def provider_cli(name: str, pcfg: Dict[str, Any]) -> str:
 
 
 def worker_roles(cfg: Dict[str, Any]) -> List[str]:
+    builtin = [r for r in WORKER_ROLES if r in cfg["providers"]]
     custom = sorted(n for n, p in cfg["providers"].items()
                     if is_custom(n, p) and NAME_RE.match(n) and p.get("command") and p.get("worker", True))
-    return list(WORKER_ROLES) + custom
+    return builtin + custom
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -431,6 +443,15 @@ def provider_command(provider: str, cfg: Dict[str, Any], mode: str, workdir: Pat
         elif write:
             cmd.append("--sandbox")
         return cmd, None
+    if provider == "cline":
+        cmd = ["cline", "--json", "-c", str(workdir), "-t", str(timeout_min * 60), "--auto-approve", "true"]
+        if model:
+            cmd += ["-m", model]
+        if cfg.get("effort"):
+            cmd += ["--thinking", cfg["effort"]]
+        if not write:
+            cmd.append("--plan")
+        return cmd + [prompt], None
     command = cfg.get("command")
     if not isinstance(command, list) or not command:
         raise HarnessError(f"provider {provider} has no command configured")
@@ -497,11 +518,12 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
 
         log_rel = f"logs/{base_name}.{provider}.log"
         message_file = run.dir / "results" / f"{base_name}.{provider}.message.md"
-        timeout_min = int(cfg.get("call_timeout_minutes", 45))
+        timeout_min = int(pcfg.get("timeout_minutes") or cfg.get("call_timeout_minutes", 45))
         cmd, stdin_text = provider_command(provider, pcfg, mode, workdir, prompt, message_file, timeout_min)
         run.set_task(task, provider=provider, log=log_rel)
         run.event(f"{base_name}: {pcfg.get('label', provider)} started")
-        stream = ClaudeStream() if provider == "claude" else AgyJson() if provider == "antigravity" else None
+        stream = (ClaudeStream() if provider == "claude" else AgyJson() if provider == "antigravity"
+                  else ClineJson() if provider == "cline" else None)
         call_started = now()
         code = run_process(run, cmd, stdin_text, workdir, run.dir / log_rel, timeout_min * 60,
                            stream.line if stream else None)
@@ -513,6 +535,8 @@ def call_agent(run: Run, task: Dict[str, Any], role: str, mode: str, workdir: Pa
         if usage:
             record_usage(run, task, provider, usage)
         status = "timeout" if code == 124 else classify_failure(code, output)
+        if getattr(stream, "aborted", False) and not (stream.result or "").strip():
+            status = "no-output"  # e.g. Cline's model never answered before its own timeout
         result = ""
         if status == "ok":
             result = message_file.read_text(errors="replace") if message_file.exists() else output
@@ -641,6 +665,39 @@ class AgyJson:
         return (f"[{status.lower()}]\n" if status and status != "SUCCESS" else "") + self.result
 
 
+class ClineJson:
+    """Reads `cline --json` NDJSON: tool/progress events become short log lines; run_result carries text and usage."""
+
+    def __init__(self) -> None:
+        self.result: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
+        self.aborted = False
+
+    def line(self, raw: str) -> Optional[str]:
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.rstrip("\n") or None
+        if not isinstance(ev, dict):
+            return None
+        if ev.get("type") == "run_result":
+            self.aborted = ev.get("finishReason") != "completed"
+            u = ev.get("aggregateUsage") or ev.get("usage") or {}
+            self.usage = make_usage(u.get("inputTokens"), u.get("outputTokens"), u.get("cacheReadTokens"),
+                                    u.get("cacheWriteTokens"), cost=u.get("totalCost") or None)
+            self.result = str(ev.get("text") or "")
+            reason = ev.get("finishReason")
+            model = (ev.get("model") or {}).get("id", "")
+            head = f"[{reason}] {model}" if reason == "completed" else f"[error] {reason} {ev.get('error') or ''}"
+            return f"{head}\n{self.result}"
+        event = ev.get("event") or {}
+        if event.get("type") == "tool_call" or event.get("type") == "tool_use":
+            return f"[tool] {event.get('name') or event.get('tool')}"
+        if ev.get("type") == "error" or event.get("type") == "error":
+            return f"[error] {ev.get('message') or event.get('message') or raw.strip()}"
+        return None
+
+
 CODEX_TOKENS_RE = re.compile(r"(?im)^\s*tokens used\s*:?\s*\n?\s*([\d,]+)\s*$")
 
 
@@ -734,12 +791,13 @@ def role_guide(cfg: Dict[str, Any]) -> str:
         "antigravity": "Google Antigravity: frontend/UI work and alternative implementations.",
         "claude": "Claude Opus: coordinator and security reviewer; avoid assigning worker tasks to it.",
         "sol": "Codex Sol: strongest Codex, expensive. Hard design or security-critical code.",
+        "cline": "Cline Pixel Canary: free stealth model, strong on frontend/Next.js; prompts may be used for training.",
     }
     lines = []
     for role in worker_roles(cfg):
         pcfg = cfg["providers"].get(role, {})
         state = "on" if pcfg.get("enabled") else "off (auto-replaced by fallback)"
-        note = notes.get(role) or f"{pcfg.get('label', role)}: {pcfg.get('notes') or 'custom agent CLI.'}"
+        note = pcfg.get("notes") or notes.get(role) or f"{pcfg.get('label', role)}: custom agent CLI."
         lines.append(f"- {role} [{state}]: {note}")
     return "\n".join(lines)
 
@@ -1182,6 +1240,8 @@ PROVIDER_TRAITS = {
     "luna": "Codex GPT Luna. Faster, cheaper Codex model for bounded implementation and QA; shares the Codex quota.",
     "kimi": "OpenCode Kimi. Cheap but slow; docs, broad repetitive edits. Small 5-hour quota.",
     "antigravity": "Google Antigravity. Frontend/UI and alternative implementations; cannot run shell commands in sandbox mode.",
+    "cline": "Cline Pixel Canary. Free stealth model, strong on frontend/Next.js per Cline's evals; unmeasured here. "
+             "Prompts may be used for training, so avoid it for private or sensitive code.",
 }
 
 
@@ -1236,9 +1296,9 @@ def route_task(run: Run, integration: Path, allow_harness: bool) -> Dict[str, An
     """Ask the router once; fall back to the preference order if it fails or answers nonsense."""
     cfg = load_config()
     candidates = available_providers(cfg)
-    order = ["claude", "sol", "luna", "kimi", "antigravity"]
+    order = ["claude", "sol", "luna", "kimi", "antigravity", "cline"]
     if cfg.get("solo_preference") == "tokens":
-        order = ["sol", "luna", "claude", "kimi", "antigravity"]
+        order = ["sol", "luna", "claude", "kimi", "antigravity", "cline"]
     default_role = next((p for p in order if p in candidates), next(iter(candidates), "claude"))
     decision = {"route": "solo", "role": default_role, "reason": "default order", "by": "default"}
     if not candidates:
@@ -1633,10 +1693,40 @@ def cmd_init(_args: argparse.Namespace) -> None:
     if not CONFIG_PATH.exists():
         write_json(CONFIG_PATH, DEFAULT_CONFIG)
         print(f"Wrote {CONFIG_PATH}")
+    else:
+        # New built-in providers appear in existing configs (unless the user deleted them), so the app lists them.
+        user = json.loads(CONFIG_PATH.read_text())
+        removed = set(user.get("removed_providers", []))
+        added = [n for n in DEFAULT_CONFIG["providers"] if n not in removed and n not in user.get("providers", {})]
+        for name in added:
+            user.setdefault("providers", {})[name] = DEFAULT_CONFIG["providers"][name]
+            user.setdefault("fallback", {}).setdefault(name, DEFAULT_CONFIG["fallback"].get(name, []))
+        if added:
+            write_json(CONFIG_PATH, user)
+            print(f"Added providers: {', '.join(added)}")
     OPENCODE_AGENTS.mkdir(parents=True, exist_ok=True)
     for name, body in KIMI_AGENTS.items():
         (OPENCODE_AGENTS / name).write_text(body)
     print(f"Installed OpenCode agents in {OPENCODE_AGENTS}")
+
+
+KNOWN_MODELS = {
+    "claude": ["opus", "sonnet", "haiku"],
+    "sol": ["gpt-5.6-sol"],
+    "luna": ["gpt-5.6-luna"],
+    "kimi": ["kimi-code-plan-global/kimi-for-coding"],
+    "cline": ["stealth/pixel-canary", "perceptron/perceptron-mk1.5"],
+}
+
+
+def cmd_models(args: argparse.Namespace) -> None:
+    """Model ids a provider accepts, one per line (live list for Antigravity)."""
+    if args.provider == "antigravity" and shutil.which("agy"):
+        out = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=60).stdout
+        rows = [l.split("\t")[0] for l in out.splitlines() if "\t" in l]
+        print("\n".join(rows))
+        return
+    print("\n".join(KNOWN_MODELS.get(args.provider, [])))
 
 
 def cmd_limits(args: argparse.Namespace) -> None:
@@ -2019,6 +2109,8 @@ def main() -> None:
     p.add_argument("--config", help="JSON merged into the config for every approach, e.g. to turn providers off")
     p.add_argument("--arm-config", action="append", metavar="NAME=JSON",
                    help="config overlay for a harness variant, e.g. harness-classic='{\"fast_path\": false}'")
+    p = sub.add_parser("models", help="list model ids a provider accepts")
+    p.add_argument("provider")
     p = sub.add_parser("limits", help="show or clear remembered usage limits")
     p.add_argument("action", nargs="?", choices=("clear",))
     p.add_argument("provider", nargs="?")
@@ -2034,7 +2126,7 @@ def main() -> None:
         else:
             {"resume": cmd_resume, "status": cmd_status, "stop": cmd_stop, "list": cmd_list, "apply": cmd_apply,
              "cleanup": cmd_cleanup, "init": cmd_init, "config": cmd_config, "bench": cmd_bench,
-             "limits": cmd_limits}[args.cmd](args)
+             "limits": cmd_limits, "models": cmd_models}[args.cmd](args)
     except HarnessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
